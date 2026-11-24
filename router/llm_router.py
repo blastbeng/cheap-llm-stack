@@ -327,28 +327,35 @@ def bump(route: str) -> None:
 # other half of the pair first: `deep` is opt-in, and paying a 25 s MoE reload
 # after an explicit 170 s thinking request is the cheap side of that trade.
 HEAVY_ALTERNATIVES = {"reasoner": ("deep",), "deep": ("reasoner",)}
-_last_heavy: str | None = None
 _room_lock = threading.Lock()
 
 
+def running_models() -> set[str]:
+    """Cheap: llama-swap answers from its own state, no model is touched."""
+    try:
+        return {m["model"] for m in upstream_json("/running", timeout=5).get("running", [])}
+    except Exception:
+        return set()
+
+
 def make_room(model: str) -> None:
-    global _last_heavy
-    with _room_lock:
-        previous, _last_heavy = _last_heavy, model
-    if previous is None or previous == model:
+    others = HEAVY_ALTERNATIVES.get(model)
+    if not others:
         return
-    for other in HEAVY_ALTERNATIVES.get(model, ()):
-        if other != previous:
-            continue
-        try:
-            req = urllib.request.Request(
-                "http://%s:%d/api/models/unload/%s" % (UPSTREAM_HOST, UPSTREAM_PORT, other),
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=180).close()
-            log("room: unloaded %s before loading %s" % (other, model))
-        except Exception as exc:
-            log("room: could not unload %s: %s" % (other, exc))
+    with _room_lock:  # serialise: two parallel requests must not fight over the pair
+        running = running_models()
+        for other in others:
+            if other not in running:
+                continue
+            try:
+                req = urllib.request.Request(
+                    "http://%s:%d/api/models/unload/%s" % (UPSTREAM_HOST, UPSTREAM_PORT, other),
+                    method="POST",
+                )
+                urllib.request.urlopen(req, timeout=180).close()
+                log("room: unloaded %s to make space for %s" % (other, model))
+            except Exception as exc:
+                log("room: could not unload %s: %s" % (other, exc))
 
 
 # --------------------------------------------------------------- language -----
