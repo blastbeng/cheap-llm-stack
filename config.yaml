@@ -25,7 +25,11 @@ macros:
   gen_args: --flash-attn on --jinja --no-webui
   # 2 threads = one per Cortex-A76 (generation is memory-bandwidth bound);
   # 8 batch threads across both clusters maximises prefill.
-  thr_args: --threads 2 --threads-batch 8
+  # parallel 1: llama.cpp allocates one compute-buffer set per slot, and this board
+  # serves one request at a time. The default of 4 cost ~1 GB per model (measured:
+  # Qwen3-0.6B 1.79 GB -> 0.96 GB, Qwen3.5-2B 3.53 GB -> 2.4 GB). That is what makes
+  # four resident models + the 5 GB MoE fit in 12 GB.
+  thr_args: --threads 2 --threads-batch 8 --parallel 1
   kv_args: --cache-type-k q8_0 --cache-type-v q8_0
 
 routing:
@@ -74,7 +78,7 @@ models:
       -m ${models_dir}/Qwen3-Embedding-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 8192 --batch-size 2048 --ubatch-size 512
+      --ctx-size 8192 --batch-size 1024 --ubatch-size 512
       ${kv_args}
       --embedding --pooling last
       --alias embedding-model
