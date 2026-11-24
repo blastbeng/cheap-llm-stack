@@ -23,7 +23,10 @@ Decision cascade (fastest first):
   5. default                         -> reasoner (MoE workhorse)
 
 The thinking model ("deep") is never chosen automatically: at 2.9 tok/s a bounded
-think costs ~90 s, so it must be an explicit `model: deep`.
+think costs ~90 s, so it must be an explicit `model: deep`. Because it cannot share
+the board with the MoE (measured: 5 GB of the MoE pushed into zram), the router
+unloads whichever of the two is not about to run — the group model in llama-swap
+cannot do it, the MoE is `persistent` and so exempt from `heavy`'s swap.
 
 Every route is sticky per session (X-Session-Id header, else a hash of the first
 user message, else client IP+UA) for STICKY_TTL seconds. Stickiness matters: a
@@ -313,6 +316,57 @@ def bump(route: str) -> None:
         _stats[route] = _stats.get(route, 0) + 1
 
 
+# ------------------------------------------------------------ memory policy ---
+# The MoE (5 GB of weights, copied into anonymous memory) and the 4B (3.4 GB of
+# weights + ~1.5 GB of compute buffers) do not fit together in 12 GB. Measured on
+# the board with both resident: VmSwap of the MoE = 5.0 GB, i.e. the kernel pushed
+# the *whole workhorse* into zram and every later MoE request crawled. llama-swap
+# groups cannot express this exclusion on their own, because the MoE lives in the
+# persistent `core` group and is therefore exempt from `heavy`'s swap. The router
+# is the only component that knows which model is about to run, so it unloads the
+# other half of the pair first: `deep` is opt-in, and paying a 25 s MoE reload
+# after an explicit 170 s thinking request is the cheap side of that trade.
+HEAVY_ALTERNATIVES = {"reasoner": ("deep",), "deep": ("reasoner",)}
+_last_heavy: str | None = None
+_room_lock = threading.Lock()
+
+
+def make_room(model: str) -> None:
+    global _last_heavy
+    with _room_lock:
+        previous, _last_heavy = _last_heavy, model
+    if previous is None or previous == model:
+        return
+    for other in HEAVY_ALTERNATIVES.get(model, ()):
+        if other != previous:
+            continue
+        try:
+            req = urllib.request.Request(
+                "http://%s:%d/api/models/unload/%s" % (UPSTREAM_HOST, UPSTREAM_PORT, other),
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=180).close()
+            log("room: unloaded %s before loading %s" % (other, model))
+        except Exception as exc:
+            log("room: could not unload %s: %s" % (other, exc))
+
+
+# --------------------------------------------------------------- language -----
+# The 0.6B drifts between languages: asked "grazie, sei gentile" in Italian it
+# answered in Spanish. One short system line fixes it and costs ~20 prompt tokens.
+LANG_HINT = "Rispondi nella stessa lingua dell'utente. Sii breve e concreto."
+
+
+def keep_language(body: dict) -> dict:
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return body
+    if any(isinstance(m, dict) and m.get("role") == "system" for m in msgs):
+        return body
+    body["messages"] = [{"role": "system", "content": LANG_HINT}] + msgs
+    return body
+
+
 # ------------------------------------------------------------------ routing ---
 def message_text(messages: list[dict]) -> str:
     parts = []
@@ -486,12 +540,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": {"message": "invalid json"}})
             requested = str(body.get("model") or "auto")
             if requested and requested.lower() not in ("auto", "router", "orchestrator"):
+                make_room(requested)
                 return self._forward(raw, path, requested, requested, "client", 0.0)
 
             t0 = time.time()
             route, why = decide(body, self.headers, self.address_string())
             model = ROUTE_MODEL.get(route, DEFAULT_ROUTE)
             body["model"] = model
+            if route == "fast":
+                body = keep_language(body)
+            make_room(model)
             elapsed = (time.time() - t0) * 1000.0
             bump(route)
             log("route=%s model=%s by=%s %.0fms" % (route, model, why, elapsed))
