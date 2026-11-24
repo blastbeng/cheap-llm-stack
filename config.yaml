@@ -11,7 +11,9 @@
 healthCheckTimeout: 300          # first load from microSD can take a while
 logLevel: info
 logToStdout: both
-startPort: 10001
+# llama-swap itself listens on :10001 (see systemd unit), so the backend
+# llama-server children must start above it or they collide on the bind.
+startPort: 10101
 globalConcurrencyLimit: 4
 
 macros:

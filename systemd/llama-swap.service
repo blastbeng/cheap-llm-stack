@@ -10,7 +10,7 @@ User=root
 Group=root
 WorkingDirectory=/opt/cheap-llm-stack
 Environment=LLAMA_SWAP_CONFIG=/opt/cheap-llm-stack/config.yaml
-ExecStart=/opt/cheap-llm-stack/bin/llama-swap --host 0.0.0.0 --port 10001 --config /opt/cheap-llm-stack/config.yaml
+ExecStart=/opt/cheap-llm-stack/bin/llama-swap --listen 0.0.0.0:10001 --config /opt/cheap-llm-stack/config.yaml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=5
