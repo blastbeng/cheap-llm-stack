@@ -14,7 +14,6 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
               ├── reasoner              LFM2-8B-A1B  MoE Q4_K_M 8k   CORE, text workhorse
               ├── router-0.6b           Qwen3-0.6B            Q8_0   4k   heavy, fast tier
               ├── assistant             Qwen3.5-2B UD-Q4_K_XL 8k   heavy, text+vision
-              ├── deep                  Qwen3.5-4B UD-Q4_K_XL 16k  heavy, thinking
               └── vision-docs           Qwen3-VL-2B  UD-Q4_K_XL 8k   heavy, OCR/tables
 ```
 
@@ -30,7 +29,7 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | **6.3** | 34 (`-t 8`) |
   | **LFM2-8B-A1B (MoE) Q4_K_M** | 5.04 GB | **10.7** | 24.8 (`-t 8`) |
   | OLMoE-1B-7B q4_k_m | 4.21 GB | 13.2 | 30.6 (`-t 8`) |
-  | Qwen3.5-4B UD-Q4_K_XL | 2.70 GB | **3.0** | 12.7 (`-t 8`) |
+  | Qwen3.5-4B UD-Q4_K_XL | 2.70 GB | 3.0 | 12.7 (`-t 8`) | not shipped |
   | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | **7.5** | — (HTTP, ~2 s/image) |
 
 * **MoE is the key finding.** `LFM2-8B-A1B` holds 8.4B of weights but activates
@@ -43,11 +42,20 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   arithmetic, strict JSON, email, explanation), three models, anonymised and
   graded blind: **LFM2-8B-A1B won 5/6, Qwen3.5-4B 1/6, OLMoE-1B-7B 0/6**. OLMoE
   is the fastest of the three but lost on quality, so it is not shipped.
-* **Thinking costs 2 minutes at 2.9 tok/s.** Qwen3.5-4B spent 349 tokens on
-  `17*23` unconstrained (~2 min). It is therefore kept as `deep`, with
-  `--reasoning-budget 256` and a budget message that stops the model mid-thought
-  instead of truncating it, and it is **never auto-selected** — ask for it with
-  `model: deep`.
+* **There is no thinking tier, and that is a measurement.** A 4B dense model
+  decodes at 3.0 tok/s here, a 2B at ~6: with `--reasoning on --reasoning-budget 256`
+  the 4B spent **170 s** on one definition question, and the 2B with a 96-token
+  budget still ran to 500 tokens = **83 s**. Nothing interactive fits in that, and
+  every use of the 4B evicted the MoE, which then took **121 s** to come back from
+  microSD. The 4B is therefore not shipped at all. The MoE answers the same
+  questions correctly in ~11 s without a visible thinking pass.
+* **The MoE is also the accuracy tier.** Six Italian factual prompts (MoE, Dante,
+  `17*23`, HTTP/2, first iPhone, RAM vs swap) run against the MoE and the 2B:
+  both got 6/6 right, the MoE was ~2x faster and had better grammar (the 2B wrote
+  *"è un architetture"*, invented *"Dante Alciat"* and a wrong Purgatorio date).
+  No split tier was worth adding. Its one real weakness is a bare acronym it does
+  not know — asked `MoE` without the expansion it invented *"Model of Explanation"*,
+  so the router sends definition-shaped questions to it only with the term intact.
 * **Speculative decoding does not pay here.** Measured on the 2B with a 0.8B
   draft: 6.16 tok/s → 4.79 (n=3) → 3.09 (n=8); `ngram-*` gave no change. Draft
   verification is bandwidth-bound on the same two cores, so it is disabled.
@@ -75,7 +83,7 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
 | `--threads` | **2** | one per A76; more threads contend for bandwidth and slow generation (pinned to A55: 8.8 tok/s vs 16.8) |
 | `--threads-batch` | **8** | prefill parallelises across all eight cores (+35–60 % pp) |
 | KV cache | **q8_0** (`--flash-attn on`) | half the KV footprint, negligible quality loss |
-| chat ctx | **8192** (deep/vision-docs 16384) | 8k prefill already costs ~5 min at 25 tok/s; bigger windows only burn RAM |
+| chat ctx | **8192** | 8k prefill already costs ~5 min at 25 tok/s; 16k on the MoE costs +1.2 GB of KV and would leave no headroom for a VLM |
 | embedding ctx | **4096** | mandatory model, always resident: keep its KV small |
 | `--parallel` | **1** | llama.cpp sizes compute buffers per slot; the default 4 cost ~1 GB/model |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 5 GB MoE stays reclaimable |
@@ -90,6 +98,7 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
 | Qwen3-0.6B | 0.62 GB | 1.16 GB at 8k → 0.6 GB at 4k | 4096 |
 | Qwen3.5-2B + mmproj | 1.30 GB | 2.1 GB at 16k → 1.0 GB at 8k | 8192 |
 | LFM2-8B-A1B | 5.04 GB (mmap) + 0.63 resident | **5.0 GB at 16k → 1.2 GB at 8k** | 8192 |
+| Qwen3.5-4B + mmproj | 2.91 GB | 3.1 GB at 16k | not shipped |
 
 At 16k the four resident models needed ~12.5 GB and the board went into zram swap
 (5.7 GB swapped, 400 MB available) — the MoE then took 5 minutes to answer its
@@ -99,12 +108,17 @@ page cache for the cold models.
 `--load-mode mmap+mlock` (core) pins weights so they never page out; the heavy
 group uses plain `mmap` so its 5 GB stay reclaimable instead of forcing swap.
 
+Measured worse case, for the record: with the 4B resident next to the MoE the
+kernel pushed **`VmSwap` 5.00 GB** of the MoE into zram (its `RssAnon` fell to
+0.7 MB). That is the state the removed tier used to create, and it is why the
+group model alone could not be trusted to keep the stack fast.
+
 ## Groups
 
 | group | swap | members | effect |
 | --- | --- | --- | --- |
 | `core` | no, `persistent` | embedding-model, reasoner | always loaded, never evicted (~5.7 GB anon) |
-| `heavy` | yes | router-0.6b, assistant, deep, vision-docs | one at a time, on demand |
+| `heavy` | yes | router-0.6b, assistant, vision-docs | one at a time, on demand |
 
 Why the fast tier and the VLMs are *not* resident: 12 GB sits exactly at the
 limit. With embedding + 0.6B + VLM + MoE loaded the board had 226 MB available
@@ -125,10 +139,19 @@ memory, so it is preloaded and never evicted).
 | `GET /stats` | per-route counters, sticky sessions, prototype state |
 
 Response headers `X-Route`, `X-Route-Model`, `X-Route-By`, `X-Route-Ms` show what
-was chosen and why (`client`, `sticky`, `image`, `image+ocr-hint`, `code`,
-`reasoning`, `trivial`, `semantic(0.71/0.09)`, `default`). Routes: `fast` →
-router-0.6b, `assistant`/`reason` → reasoner, `vision` → assistant, `vision-docs`
-→ vision-docs, `embedding` → embedding-model.
+was chosen and why (`client`, `sticky`, `image`, `image+ocr-hint`, `chitchat`,
+`code`, `reasoning`, `trivial`, `translate-short`, `semantic(0.71/0.09)`,
+`semantic-fast-rejected`, `default`). Routes: `fast` → router-0.6b,
+`assistant`/`reason` → reasoner, `vision` → assistant, `vision-docs` →
+vision-docs, `embedding` → embedding-model.
+
+Two routing guards exist because the 0.6B failed on them in testing: a request
+that *writes* code is never sent to it however short it is (`scrivi una funzione
+python …`, 9 words, produced broken docstring prose), and one that asks what a
+technical term *is* is not either (it answered `MoE = "Model of Explanation"`).
+Small talk goes the other way — `ciao, come stai?` now lands on the tiny tier in
+1.0 s instead of waking the 5 GB model, with a one-line system prompt that keeps
+it in the user's language (it used to answer Italian with Spanish).
 
 ## Operations
 

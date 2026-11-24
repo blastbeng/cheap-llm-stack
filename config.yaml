@@ -12,8 +12,10 @@
 #   * the text workhorse is a Mixture-of-Experts (LFM2-8B-A1B): 8B total weights but only
 #     1.1B active per token, so it decodes at 10.7 tok/s — faster than the dense 2B (6.3 tok/s)
 #     and better on every blind-graded prompt. On a bandwidth-bound board MoE is a free win.
-#   * resident set: embedding + 0.6B router + 2B VLM + the MoE ≈ 9 GB, leaving page cache
-#     for the cold models (deep / vision-docs) so a swap is seconds, not a 40 s microSD read.
+#   * resident set: embedding + the MoE ≈ 5.7 GB, leaving ~3.5 GB of page cache for the
+#     cold models (router / assistant / vision-docs) so a swap is seconds, not a microSD read.
+#   * no 4B tier: see the note before the vision specialist. At 2.9 tok/s every thinking
+#     request cost 170 s, and using it evicted the MoE, which then needed ~120 s to return.
 #   * never swap the embedding model: it is in the "core" group with persistent: true.
 
 healthCheckTimeout: 300          # first load from microSD can take a while
@@ -70,14 +72,13 @@ routing:
           members:
             - router-0.6b
             - assistant
-            - deep
             - vision-docs
 
 hooks:
   on_startup:
     # Only what must never be cold: the mandatory embedding model and the MoE
-    # workhorse. Vision, the fast tier and deep thinking load on first use (their
-    # weights stay in page cache, so that costs seconds, not a 40 s microSD read).
+    # workhorse. The fast tier and the two VLMs load on first use (their weights
+    # stay in page cache, so that costs seconds, not a 100 s microSD read).
     preload:
       - embedding-model
       - reasoner
@@ -110,7 +111,7 @@ models:
   # Tiny model for one-line answers: 16.8 tok/s vs 10.7 for the MoE, i.e. ~2 s saved
   # on a 60-token reply. That is not worth 1.5 GB of permanent RAM on a 12 GB board,
   # so it is a heavy-group member: loaded on the first trivial request and kept
-  # (ttl 0) until a vision/deep request swaps it out.
+  # (ttl 0) until a vision request swaps it out.
   router-0.6b:
     name: "Qwen3-0.6B · fast tier · 16.8 tok/s"
     cmd: >
@@ -193,35 +194,13 @@ models:
       out: [text]
       tools: true
 
-  # --------------------------------------------------- deliberate deep thinking ---
-  # Qwen3.5-4B with thinking ON but capped. Measured: unconstrained thinking ran 349
-  # tokens for 17*23 (~2 min at 2.9 tok/s); the budget keeps it near 90 s and the
-  # budget-message stops the model mid-thought instead of truncating it.
-  # Never selected automatically — ask for it with model "deep".
-  deep:
-    name: "Qwen3.5-4B · thinking (budget 256) · text+vision · 2.9 tok/s"
-    cmd: >
-      ${llama_bin}
-      -m ${models_dir}/Qwen3.5-4B-UD-Q4_K_XL.gguf
-      --mmproj ${models_dir}/mmproj-Qwen3.5-4B-F16.gguf
-      --host 127.0.0.1 --port ${PORT}
-      ${thr_args}
-      --ctx-size 16384 ${kv_args}
-      ${gen_args}
-      --reasoning on --reasoning-budget 256
-      --reasoning-budget-message "Stop thinking and give the final answer now."
-      --alias deep
-      --load-mode mmap
-    ttl: 1800
-    aliases:
-      - assistant-large
-      - qwen3.5-4b
-      - think
-    checkEndpoint: /health
-    capabilities:
-      in: [text, image]
-      out: [text]
-      tools: true
+  # No "big thinking" tier on purpose. A 4B dense model decodes at 2.9 tok/s here
+  # and a 2B at ~6 tok/s, so any request that reasons before answering costs 80-170 s
+  # no matter how the budget is set (measured: 4B + budget 256 = 170 s; 2B + budget 96
+  # still produced 500 tokens = 83 s). On a board nobody will sit and wait for, that
+  # is not a tier, it is a trap — and every use of it evicts the MoE, which then needs
+  # ~120 s to come back from microSD. The MoE answers the same questions correctly in
+  # ~11 s without a visible thinking pass, so it simply *is* the quality tier.
 
   # ------------------------------------------------------- vision specialist ---
   # Dedicated VLM for OCR, tables, screenshots, diagrams. Not preloaded:
