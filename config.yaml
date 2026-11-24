@@ -114,11 +114,12 @@ models:
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
+      --ubatch-size 256
       --ctx-size 4096 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias router-0.6b
-      --load-mode mmap+mlock
+      --load-mode mmap
     ttl: 0
     aliases:
       - fast
@@ -146,8 +147,8 @@ models:
       ${gen_args}
       --reasoning off
       --alias assistant
-      --load-mode mmap+mlock
-    ttl: 900
+      --load-mode mmap
+    ttl: 600
     aliases:
       - qwen3.5-2b
       - vlm
