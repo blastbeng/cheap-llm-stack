@@ -20,7 +20,10 @@ macros:
   models_dir: /opt/cheap-llm-stack/models
   llama_bin: /opt/cheap-llm-stack/bin/llama-server
   # 2 generation threads on the A76 cluster; 8 batch threads for prefill (measured +35..60% pp).
-  gen_args: --threads 2 --threads-batch 8 --flash-attn on --jinja --no-webui
+  gen_args: --flash-attn on --jinja --no-webui
+  # 2 threads = one per Cortex-A76 (generation is memory-bandwidth bound);
+  # 8 batch threads across both clusters maximises prefill.
+  thr_args: --threads 2 --threads-batch 8
   kv_args: --cache-type-k q8_0 --cache-type-v q8_0
 
 routing:
@@ -66,7 +69,7 @@ models:
       ${llama_bin}
       -m ${models_dir}/Qwen3-Embedding-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
-      --threads 2 --threads-batch 8
+      ${thr_args}
       --ctx-size 8192 --batch-size 2048 --ubatch-size 512
       ${kv_args}
       --embedding --pooling last
@@ -89,9 +92,10 @@ models:
       ${llama_bin}
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
-      --threads 2 --threads-batch 8
+      ${thr_args}
       --ctx-size 8192 ${kv_args}
       ${gen_args}
+      --reasoning off
       --alias router-0.6b
       --load-mode mmap+mlock
     ttl: 0
@@ -113,9 +117,10 @@ models:
       -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
       --mmproj ${models_dir}/mmproj-Qwen3.5-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
-      --threads 2 --threads-batch 8
+      ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
+      --reasoning auto
       --alias assistant
       --load-mode mmap+mlock
     ttl: 0
@@ -137,9 +142,10 @@ models:
       -m ${models_dir}/Qwen3.5-4B-UD-Q4_K_XL.gguf
       --mmproj ${models_dir}/mmproj-Qwen3.5-4B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
-      --threads 2 --threads-batch 8
+      ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
+      --reasoning on
       --alias assistant-large
       --load-mode mmap
     ttl: 1800
@@ -162,9 +168,10 @@ models:
       -m ${models_dir}/Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf
       --mmproj ${models_dir}/mmproj-Qwen3-VL-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
-      --threads 2 --threads-batch 8
+      ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
+      --reasoning off
       --alias vision-docs
     ttl: 900
     aliases:

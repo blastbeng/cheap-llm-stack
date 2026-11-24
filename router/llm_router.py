@@ -162,6 +162,17 @@ def upstream_json(path: str, payload: dict | None = None, timeout: float = 120.0
         return json.loads(resp.read().decode())
 
 
+def upstream_ok(path: str = "/health", timeout: float = 5.0) -> bool:
+    """True when llama-swap answers 2xx. It replies with the plain text "OK",
+    not JSON, so this must not try to parse a body."""
+    url = "http://%s:%d%s" % (UPSTREAM_HOST, UPSTREAM_PORT, path)
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
 def embed(texts: list[str]) -> list[list[float]]:
     out = upstream_json(
         "/v1/embeddings",
@@ -388,11 +399,9 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body = {"status": "ok", "upstream": "http://%s:%d" % (UPSTREAM_HOST, UPSTREAM_PORT),
                     "routes": ROUTE_MODEL, "prototypes_ready": PROTO.ready.is_set()}
-            try:
-                upstream_json("/health", timeout=5)
-            except Exception as exc:
+            if not upstream_ok("/health"):
                 body["status"] = "degraded"
-                body["upstream_error"] = str(exc)
+                body["upstream_error"] = "llama-swap did not answer /health"
             return self._json(200 if body["status"] == "ok" else 503, body)
         if self.path == "/stats":
             with _stats_lock:
