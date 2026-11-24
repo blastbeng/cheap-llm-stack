@@ -35,6 +35,11 @@ macros:
   # Qwen3-0.6B 1.79 GB -> 0.96 GB, Qwen3.5-2B 3.53 GB -> 2.4 GB). That is what makes
   # four resident models + the 5 GB MoE fit in 12 GB.
   thr_args: --threads 2 --threads-batch 8 --parallel 1
+  # Vision models are the exception: the image encoder (mmproj/ViT) runs on the
+  # same thread pool and it dominates the cost — 181 image tokens took 48 s at
+  # -t 2 (3.7 tok/s). All eight cores cut that ~3x, and for a 2B model generation
+  # does not suffer (measured 6.67 tok/s at -t 8 vs 6.29 at -t 2).
+  vis_args: --threads 8 --threads-batch 8 --parallel 1
   kv_args: --cache-type-k q8_0 --cache-type-v q8_0
 
 routing:
@@ -136,7 +141,7 @@ models:
       -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
       --mmproj ${models_dir}/mmproj-Qwen3.5-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
-      ${thr_args}
+      ${vis_args}
       --ctx-size 8192 ${kv_args}
       ${gen_args}
       --reasoning off
@@ -223,7 +228,7 @@ models:
       -m ${models_dir}/Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf
       --mmproj ${models_dir}/mmproj-Qwen3-VL-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
-      ${thr_args}
+      ${vis_args}
       --ctx-size 8192 ${kv_args}
       ${gen_args}
       --reasoning off
