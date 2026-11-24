@@ -145,8 +145,8 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      --reasoning auto
-      --reasoning-budget 512
+      --reasoning on
+      --reasoning-budget 384
       --alias assistant-large
       --load-mode mmap
     ttl: 1800
