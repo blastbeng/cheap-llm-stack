@@ -145,8 +145,10 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      --reasoning on
-      --reasoning-budget 384
+      # Thinking is deliberately off: at 2.9 tok/s a truncated 384-token think
+      # costs ~2 min and the answer then starts mid-thought. Flip to
+      # `--reasoning on --reasoning-budget 384` for batch/offline work.
+      --reasoning off
       --alias assistant-large
       --load-mode mmap
     ttl: 1800
