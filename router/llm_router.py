@@ -7,17 +7,23 @@ It decides *which* model should answer a request, so that the expensive act of
 switching models happens rarely and always on purpose.
 
 Why a router and not "one big model":
-  * a 2B model answers in ~8 tok/s on this board, a 4B in ~4 tok/s. Most traffic
-    (short Q&A, rewriting, classification, translation) does not need the 4B;
+  * the text workhorse is a MoE (LFM2-8B-A1B): 8.4B of weights but only 1.1B active
+    per token, so it decodes at 10.7 tok/s — faster than the dense 2B (6.3) and far
+    faster than the dense 4B (2.9), while being better than both on blind grading;
   * llama-swap can only swap by request *model name*, it cannot inspect content;
-  * therefore content-aware routing belongs in this small proxy.
+  * therefore content-aware routing belongs in this small proxy: keep the cheap,
+    always-resident models for what they are good at, and pay a swap only when the
+    request genuinely needs the 5 GB MoE, the OCR VLM or the thinking model.
 
 Decision cascade (fastest first):
   1. explicit model in the request  -> pass through untouched (no routing at all)
-  2. images present                 -> vision (or vision-docs for OCR/table tasks)
+  2. images present                 -> assistant (VLM, resident) or vision-docs (OCR/table)
   3. deterministic keyword rules     -> code / translate / summarize / reason / trivial
   4. embedding similarity            -> reuses the always-on embedding-model, 0 extra RAM
-  5. default                         -> assistant (resident 2B, text+vision)
+  5. default                         -> reasoner (MoE workhorse)
+
+The thinking model ("deep") is never chosen automatically: at 2.9 tok/s a bounded
+think costs ~90 s, so it must be an explicit `model: deep`.
 
 Every route is sticky per session (X-Session-Id header, else a hash of the first
 user message, else client IP+UA) for STICKY_TTL seconds. Stickiness matters: a
@@ -56,10 +62,14 @@ MAX_STICKY = 1024
 DEFAULT_ROUTE = "assistant"
 
 # route -> llama-swap model id
+# "assistant" and "reason" both land on the MoE: it is the best text model on the
+# board *and* the fastest of the big ones, so there is nothing to split between a
+# small default and a quality escalation for text.
 ROUTE_MODEL = {
     "fast": "router-0.6b",
-    "assistant": "assistant",
-    "large": "assistant-large",
+    "assistant": "reasoner",
+    "reason": "reasoner",
+    "deep": "deep",
     "vision": "assistant",
     "vision-docs": "vision-docs",
     "embedding": "embedding-model",
@@ -88,7 +98,7 @@ PROTOTYPES = {
         "scrivimi una email per il mio padrone di casa",
         "riassumi questo testo",
     ],
-    "large": [
+    "reason": [
         "prove that the square root of 2 is irrational step by step",
         "debug this stack trace and tell me the root cause",
         "design a fault tolerant architecture for a queue service",
@@ -336,15 +346,15 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
     # 2. code
     if CODE_RE.search(text):
         # tiny snippets ("why does this print 1?") stay on the resident model
-        return ("fast", "code-short") if words < 12 and len(text) < 160 else ("large", "code")
+        return ("fast", "code-short") if words < 12 and len(text) < 160 else ("reason", "code")
 
     # 3. reasoning / design
     if REASON_RE.search(text) and (words > 25 or len(text) > 200):
-        return "large", "reasoning"
+        return "reason", "reasoning"
 
-    # 4. summarization of a long input -> the 4B handles long context better
+    # 4. summarization of a long input
     if SUMMARY_RE.search(text) and (len(text) > 2500 or words > 400):
-        return "large", "summarize-long"
+        return "reason", "summarize-long"
 
     # 5. trivial / short factual
     if words <= 12 and len(text) <= 90 and SHORT_HINT_RE.search(low):
@@ -359,7 +369,7 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
     if sem_route and score >= SEM_THRESHOLD and margin >= SEM_MIN_MARGIN:
         return sem_route, "semantic(%.2f/%.2f)" % (score, margin)
 
-    # 8. default: resident multimodal workhorse
+    # 8. default: the MoE text workhorse (8.4B weights, 1.1B active, 10.7 tok/s)
     return DEFAULT_ROUTE, "default"
 
 

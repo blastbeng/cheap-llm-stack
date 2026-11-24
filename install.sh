@@ -167,7 +167,10 @@ if [ "${SKIP_MODELS}" = 0 ]; then
     fetch "unsloth/Qwen3.5-2B-GGUF" "Qwen3.5-2B-UD-Q4_K_XL.gguf"
     fetch "unsloth/Qwen3.5-2B-GGUF" "mmproj-F16.gguf" "mmproj-Qwen3.5-2B-F16.gguf"
 
-    # quality escalation: text + vision
+    # text workhorse: MoE, 8.4B total weights / 1.1B active per token
+    fetch "LiquidAI/LFM2-8B-A1B-GGUF" "LFM2-8B-A1B-Q4_K_M.gguf"
+
+    # deliberate deep thinking (opt-in, model "deep"): text + vision
     fetch "unsloth/Qwen3.5-4B-GGUF" "Qwen3.5-4B-UD-Q4_K_XL.gguf"
     fetch "unsloth/Qwen3.5-4B-GGUF" "mmproj-F16.gguf" "mmproj-Qwen3.5-4B-F16.gguf"
 

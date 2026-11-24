@@ -4,8 +4,11 @@
 # Design rules (measured, see README):
 #   * generation threads = 2 (one per A76); batch/prefill threads = 8 (all cores). Never raise -t above 2.
 #   * KV cache is quantized to q8_0 (needs --flash-attn on) => 16k ctx costs ~0.9 GB instead of ~1.9 GB.
-#   * resident set is small on purpose: embedding + 0.6B router + one 2B model ≈ 5 GB,
-#     leaving ~6 GB for page cache, so unloaded models reload in <2 s instead of ~40 s from the SD card.
+#   * the text workhorse is a Mixture-of-Experts (LFM2-8B-A1B): 8B total weights but only
+#     1.1B active per token, so it decodes at 10.7 tok/s — faster than the dense 2B (6.3 tok/s)
+#     and better on every blind-graded prompt. On a bandwidth-bound board MoE is a free win.
+#   * resident set: embedding + 0.6B router + 2B VLM + the MoE ≈ 9 GB, leaving page cache
+#     for the cold models (deep / vision-docs) so a swap is seconds, not a 40 s microSD read.
 #   * never swap the embedding model: it is in the "core" group with persistent: true.
 
 healthCheckTimeout: 300          # first load from microSD can take a while
@@ -19,7 +22,6 @@ globalConcurrencyLimit: 4
 macros:
   models_dir: /opt/cheap-llm-stack/models
   llama_bin: /opt/cheap-llm-stack/bin/llama-server
-  # 2 generation threads on the A76 cluster; 8 batch threads for prefill (measured +35..60% pp).
   gen_args: --flash-attn on --jinja --no-webui
   # 2 threads = one per Cortex-A76 (generation is memory-bandwidth bound);
   # 8 batch threads across both clusters maximises prefill.
@@ -31,7 +33,8 @@ routing:
     use: group
     settings:
       groups:
-        # Always resident. persistent:true => llama-swap may never evict these.
+        # Always resident (swap:false = all members run together, persistent = never evicted).
+        # exclusive:false so that loading a heavy model never unloads this group.
         core:
           swap: false
           exclusive: false
@@ -39,26 +42,27 @@ routing:
           members:
             - embedding-model
             - router-0.6b
-        # Heavy/frontier models: one at a time. Cheap to swap because the weights stay
-        # in the page cache (mmap), so a "reload" is a few hundred ms, not a disk read.
-        llm:
+            - assistant
+        # Heavy models: swap:true = only one member runs at a time. That is what keeps
+        # 12 GB safe: the largest (5.6 GB MoE) or the cold pair, never both.
+        heavy:
           swap: true
           exclusive: false
           persistent: false
           members:
-            - assistant
-            - assistant-large
+            - reasoner
+            - deep
             - vision-docs
 
 hooks:
   on_startup:
-    # All four fit in 12 GB at once (≈6.5 GB weights+KV with q8_0), so a swap
-    # becomes a no-op instead of a 40-70 s SD read. vision-docs stays cold.
+    # Everything a normal turn needs is already hot: embeddings, the 0.6B fast tier,
+    # the VLM (vision) and the MoE workhorse. deep/vision-docs stay cold on purpose.
     preload:
       - embedding-model
       - router-0.6b
       - assistant
-      - assistant-large
+      - reasoner
 
 models:
 
@@ -85,9 +89,10 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model kept warm: classification, short answers, rewrite/cleanup, router fallback.
+  # Tiny model kept warm: one-line answers, classification, rewrite/cleanup.
+  # 16.8 tok/s ≈ 1.6x the MoE, so it is still worth having for trivial turns.
   router-0.6b:
-    name: "Qwen3-0.6B · fast tier / classifier"
+    name: "Qwen3-0.6B · fast tier · 16.8 tok/s"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
@@ -108,10 +113,11 @@ models:
       out: [text]
       tools: true
 
-  # -------------------------------------------------- default workhorse (VLM) ---
-  # Qwen3.5 is natively multimodal => one resident model covers text AND vision.
+  # ---------------------------------------------------- vision workhorse (VLM) ---
+  # Qwen3.5 is natively multimodal, so ONE resident 2B covers images + text.
+  # Keeping it in the core group means a picture is answered instantly, with no swap.
   assistant:
-    name: "Qwen3.5-2B · text+vision · default"
+    name: "Qwen3.5-2B · text+vision · always resident"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
@@ -125,8 +131,8 @@ models:
       --load-mode mmap+mlock
     ttl: 0
     aliases:
-      - default
       - qwen3.5-2b
+      - vlm
       - vision
     checkEndpoint: /health
     capabilities:
@@ -134,12 +140,42 @@ models:
       out: [text]
       tools: true
 
-  # ------------------------------------------------------- quality escalation ---
-  # Thinking is deliberately off here: at 2.9 tok/s a truncated 384-token think
-  # costs ~2 min and the answer then starts mid-thought. Switch this cmd to
-  # `--reasoning on --reasoning-budget 384` for batch / offline work.
-  assistant-large:
-    name: "Qwen3.5-4B · reasoning/code escalation · text+vision"
+  # ------------------------------------------------------ text workhorse (MoE) ---
+  # LFM2-8B-A1B: 8.4B total / 1.1B active. Decodes at 10.7 tok/s (dense 2B: 6.3,
+  # dense 4B: 2.9) and won 5 of 6 blind-graded prompts against both, so it is the
+  # default for every non-trivial text request.
+  # load-mode mmap (not mlock): its 5 GB stay reclaimable, so the cold models and the
+  # page cache can still use RAM if they need it.
+  reasoner:
+    name: "LFM2-8B-A1B (MoE) · text workhorse · 10.7 tok/s"
+    cmd: >
+      ${llama_bin}
+      -m ${models_dir}/LFM2-8B-A1B-Q4_K_M.gguf
+      --host 127.0.0.1 --port ${PORT}
+      ${thr_args}
+      --ctx-size 16384 ${kv_args}
+      ${gen_args}
+      --alias reasoner
+      --load-mode mmap
+    ttl: 1800
+    aliases:
+      - default
+      - moe
+      - lfm2
+      - auto
+    checkEndpoint: /health
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
+
+  # --------------------------------------------------- deliberate deep thinking ---
+  # Qwen3.5-4B with thinking ON but capped. Measured: unconstrained thinking ran 349
+  # tokens for 17*23 (~2 min at 2.9 tok/s); the budget keeps it near 90 s and the
+  # budget-message stops the model mid-thought instead of truncating it.
+  # Never selected automatically — ask for it with model "deep".
+  deep:
+    name: "Qwen3.5-4B · thinking (budget 256) · text+vision · 2.9 tok/s"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3.5-4B-UD-Q4_K_XL.gguf
@@ -148,13 +184,15 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      --reasoning off
-      --alias assistant-large
+      --reasoning on --reasoning-budget 256
+      --reasoning-budget-message "Stop thinking and give the final answer now."
+      --alias deep
       --load-mode mmap
     ttl: 1800
     aliases:
-      - big
+      - assistant-large
       - qwen3.5-4b
+      - think
     checkEndpoint: /health
     capabilities:
       in: [text, image]
