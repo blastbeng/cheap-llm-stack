@@ -151,7 +151,22 @@ OCR_RE = re.compile(
 )
 SHORT_HINT_RE = re.compile(
     r"^(what|who|when|where|which|how much|how many|define|convert|translate|capital of"
-    r"|che|chi|quando|dove|quanto|quanti|definisci|converti)\b",
+    r"|che|chi|quando|dove|quanto|quanti|qual|quale|quali|definisci|converti)\b",
+    re.IGNORECASE,
+)
+# Greetings, thanks, "are you there": the only requests where 0.6B is unambiguously
+# good enough. Kept narrow on purpose — small talk is cheap only if it stays small.
+CHITCHAT_RE = re.compile(
+    r"^\W*(ciao|salve|hey|hi|hello|buongiorno|buonasera|grazie|thanks|thank you|ok|okay"
+    r"|sei (li|connesso)|ci sei|come stai|how are you|che ore|what time)\b",
+    re.IGNORECASE,
+)
+# Asking the model to *produce* or *change* code is never a 0.6B job, however short
+# the sentence: "scrivi una funzione python ..." is 9 words and was routed to the
+# tiny tier, which then wrote broken docstring prose.
+GENERATE_RE = re.compile(
+    r"\b(write|create|implement|generate|refactor|fix|add|rewrite|convert .* (to|into)"
+    r"|scrivi|crea|implementa|genera|rifattorizza|correggi|aggiungi|riscrivi|sistema)\b",
     re.IGNORECASE,
 )
 # Anything that asks for an explanation, a comparison or a why/how does NOT belong on
@@ -159,7 +174,17 @@ SHORT_HINT_RE = re.compile(
 # latency saved are not worth a hallucinated acronym.
 EXPLAIN_RE = re.compile(
     r"\b(explain|describe|summar|compare|difference|why|how (does|do|is|are)|tell me about"
-    r"|spiega|spiegami|descrivi|riassum|confronta|differenza|perch[eé]|come (funziona|si)\b)",
+    r"|spiega|spiegami|descrivi|riassum|confronta|differenza|perch[eé]|come (funziona|si)\b)"
+    r"|\bcos'?\s?[eè] (un|una|il|la|lo|i|gli|le|l')\b|\bche cos'?[eè]\b|\bwhat(?:'s| is) a\b",
+    re.IGNORECASE,
+)
+# Vocabulary that turns even a 5-word question into a job for the MoE: the 0.6B
+# invents acronyms when asked about anything technical ("MoE = Model of Explanation").
+TECH_RE = re.compile(
+    r"\b(moe|llm|model of experts|mixture of experts|transformer|attention|embedding|token"
+    r"|quantizzazion\w*|quantization|gguf|lora|qlora|kv[- ]cache|context window|thread|mmap"
+    r"|npu|gpu|cpu|ram|vram|swap|zram|docker|kubernetes|systemd|api|http|tls|vpn|ssh|dns"
+    r"|regex|sql|git|python|rust|golang|javascript|typescript|kernel|filesystem)\b",
     re.IGNORECASE,
 )
 
@@ -353,8 +378,10 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
 
     # 2. code
     if CODE_RE.search(text):
-        # tiny snippets ("why does this print 1?") stay on the resident model
-        return ("fast", "code-short") if words < 12 and len(text) < 160 else ("reason", "code")
+        # asking *about* a two-line snippet is a fine job for the tiny tier; asking
+        # it to *write* code is not, no matter how short the sentence is.
+        tiny_ok = words < 12 and len(text) < 160 and not GENERATE_RE.search(text)
+        return ("fast", "code-short") if tiny_ok else ("reason", "code")
 
     # 3. reasoning / design
     if REASON_RE.search(text) and (words > 25 or len(text) > 200):
@@ -364,8 +391,18 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
     if SUMMARY_RE.search(text) and (len(text) > 2500 or words > 400):
         return "reason", "summarize-long"
 
-    # 5. trivial / short factual
-    if words <= 12 and len(text) <= 90 and SHORT_HINT_RE.search(low) and not EXPLAIN_RE.search(text):
+    # 5a. small talk: greetings, thanks, "are you there"
+    if words <= 10 and CHITCHAT_RE.search(low) and not EXPLAIN_RE.search(text):
+        return "fast", "chitchat"
+
+    # 5b. trivial / short factual
+    if (
+        words <= 12
+        and len(text) <= 90
+        and SHORT_HINT_RE.search(low)
+        and not EXPLAIN_RE.search(text)
+        and not TECH_RE.search(text)
+    ):
         return "fast", "trivial"
 
     # 6. translate of short strings -> fast tier is enough
@@ -374,7 +411,7 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
 
     # 7. semantic similarity against prototypes
     sem_route, score, margin = PROTO.best_route(text)
-    if sem_route == "fast" and (words > 12 or EXPLAIN_RE.search(text)):
+    if sem_route == "fast" and (words > 12 or EXPLAIN_RE.search(text) or TECH_RE.search(text)):
         # a short-answer prototype must not capture an explanation request
         return DEFAULT_ROUTE, "semantic-fast-rejected"
     if sem_route and score >= SEM_THRESHOLD and margin >= SEM_MIN_MARGIN:
