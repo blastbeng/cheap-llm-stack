@@ -216,7 +216,9 @@ else
 fi
 
 run systemctl daemon-reload
-run systemctl enable llama-swap.service llm-router.service llama-swap-update.timer
+run systemctl enable llama-swap.service llm-router.service
+# enable + start: an enabled timer is not armed until it is started or the board reboots
+run systemctl enable --now llama-swap-update.timer
 # clear the restart counter left behind by a previously broken ExecStart
 systemctl reset-failed llama-swap.service llm-router.service 2>/dev/null || true
 run systemctl restart llama-swap.service
