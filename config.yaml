@@ -71,7 +71,7 @@ models:
       ${kv_args}
       --embedding --pooling last
       --alias embedding-model
-      --mlock
+      --load-mode mmap+mlock
     ttl: 0
     aliases:
       - embedding
@@ -93,7 +93,7 @@ models:
       --ctx-size 8192 ${kv_args}
       ${gen_args}
       --alias router-0.6b
-      --mlock
+      --load-mode mmap+mlock
     ttl: 0
     aliases:
       - fast
@@ -117,7 +117,7 @@ models:
       --ctx-size 16384 ${kv_args}
       ${gen_args}
       --alias assistant
-      --mlock
+      --load-mode mmap+mlock
     ttl: 0
     aliases:
       - default
@@ -141,7 +141,7 @@ models:
       --ctx-size 16384 ${kv_args}
       ${gen_args}
       --alias assistant-large
-      --mlock
+      --load-mode mmap
     ttl: 1800
     aliases:
       - big
