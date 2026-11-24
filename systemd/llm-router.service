@@ -1,0 +1,27 @@
+[Unit]
+Description=cheap-llm-stack llm-router (semantic orchestrator, OpenAI-compatible :10000)
+Documentation=https://github.com/blastbeng/cheap-llm-stack
+After=llama-swap.service network-online.target
+Wants=llama-swap.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/cheap-llm-stack
+Environment=ROUTER_HOST=0.0.0.0
+Environment=ROUTER_PORT=10000
+Environment=LLAMA_SWAP_HOST=127.0.0.1
+Environment=LLAMA_SWAP_PORT=10001
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/cheap-llm-stack/router/llm_router.py
+Restart=always
+RestartSec=3
+Nice=-4
+# The router is a Python proxy: keep it off the A76 cluster so generation
+# never loses a core to a routing decision.
+CPUAffinity=0-5
+OOMScoreAdjust=-400
+
+[Install]
+WantedBy=multi-user.target

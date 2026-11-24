@@ -3,8 +3,8 @@ Description=cheap-llm-stack llama.cpp rebuild (weekly/monthly)
 Documentation=https://github.com/ggerganov/llama.cpp
 
 [Timer]
-# Monthly: run on the first Sunday of each month at 03:00.
-OnCalendar=*-*-*:Sun* 03:00:00
+# Weekly: every Sunday at 03:00.
+OnCalendar=Sun 03:00:00
 Persistent=true
 AccuracySec=1h
 
