@@ -135,6 +135,9 @@ models:
       tools: true
 
   # ------------------------------------------------------- quality escalation ---
+  # Thinking is deliberately off here: at 2.9 tok/s a truncated 384-token think
+  # costs ~2 min and the answer then starts mid-thought. Switch this cmd to
+  # `--reasoning on --reasoning-budget 384` for batch / offline work.
   assistant-large:
     name: "Qwen3.5-4B · reasoning/code escalation · text+vision"
     cmd: >
@@ -145,9 +148,6 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      # Thinking is deliberately off: at 2.9 tok/s a truncated 384-token think
-      # costs ~2 min and the answer then starts mid-thought. Flip to
-      # `--reasoning on --reasoning-budget 384` for batch/offline work.
       --reasoning off
       --alias assistant-large
       --load-mode mmap
