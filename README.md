@@ -72,9 +72,29 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
 | `--threads` | **2** | one per A76; more threads contend for bandwidth and slow generation (pinned to A55: 8.8 tok/s vs 16.8) |
 | `--threads-batch` | **8** | prefill parallelises across all eight cores (+35–60 % pp) |
 | KV cache | **q8_0** (`--flash-attn on`) | half the KV footprint, negligible quality loss |
-| chat ctx | **16384** | 32k costs ~2× KV reads for no real gain at these speeds |
-| embedding ctx | **8192** | mandatory model, always resident: keep its KV small |
+| chat ctx | **8192** (deep/vision-docs 16384) | 8k prefill already costs ~5 min at 25 tok/s; bigger windows only burn RAM |
+| embedding ctx | **4096** | mandatory model, always resident: keep its KV small |
+| `--parallel` | **1** | llama.cpp sizes compute buffers per slot; the default 4 cost ~1 GB/model |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 5 GB MoE stays reclaimable |
+
+### RAM, measured (this is what forced the sizes above)
+
+`VmRSS` + `VmSwap` per llama-server with `--parallel 1`:
+
+| model | weights (file) | anon (KV + buffers) | ctx |
+| --- | --- | --- | --- |
+| Qwen3-Embedding-0.6B | 0.62 GB | 1.0 GB at 8k → 0.5 GB at 4k | 4096 |
+| Qwen3-0.6B | 0.62 GB | 1.16 GB at 8k → 0.6 GB at 4k | 4096 |
+| Qwen3.5-2B + mmproj | 1.30 GB | 2.1 GB at 16k → 1.0 GB at 8k | 8192 |
+| LFM2-8B-A1B | 5.04 GB (mmap) + 0.63 resident | **5.0 GB at 16k → 1.2 GB at 8k** | 8192 |
+
+At 16k the four resident models needed ~12.5 GB and the board went into zram swap
+(5.7 GB swapped, 400 MB available) — the MoE then took 5 minutes to answer its
+health check. At the sizes above the same set fits in ~7 GB and leaves 4–5 GB of
+page cache for the cold models.
+
+`--load-mode mmap+mlock` (core) pins weights so they never page out; the heavy
+group uses plain `mmap` so its 5 GB stay reclaimable instead of forcing swap.
 
 ## Groups
 

@@ -3,7 +3,12 @@
 #
 # Design rules (measured, see README):
 #   * generation threads = 2 (one per A76); batch/prefill threads = 8 (all cores). Never raise -t above 2.
-#   * KV cache is quantized to q8_0 (needs --flash-attn on) => 16k ctx costs ~0.9 GB instead of ~1.9 GB.
+#   * KV cache is quantized to q8_0 (needs --flash-attn on) => half the KV footprint.
+#   * context is sized to what this board can actually prefill: an 8k prompt costs
+#     ~5 minutes of prefill at 25 tok/s, so bigger windows would only burn RAM.
+#     The MoE is full-attention, which makes its KV expensive (~150 KB/token q8):
+#     8k ctx keeps it at ~1.2 GB; 16k would have cost 2.4 GB and pushed the board
+#     into zram swap (measured: 5 GB anon for the MoE at 16k).
 #   * the text workhorse is a Mixture-of-Experts (LFM2-8B-A1B): 8B total weights but only
 #     1.1B active per token, so it decodes at 10.7 tok/s — faster than the dense 2B (6.3 tok/s)
 #     and better on every blind-graded prompt. On a bandwidth-bound board MoE is a free win.
@@ -78,7 +83,7 @@ models:
       -m ${models_dir}/Qwen3-Embedding-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 8192 --batch-size 1024 --ubatch-size 512
+      --ctx-size 4096 --batch-size 1024 --ubatch-size 512
       ${kv_args}
       --embedding --pooling last
       --alias embedding-model
@@ -102,7 +107,7 @@ models:
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 8192 ${kv_args}
+      --ctx-size 4096 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias router-0.6b
@@ -128,7 +133,7 @@ models:
       --mmproj ${models_dir}/mmproj-Qwen3.5-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 16384 ${kv_args}
+      --ctx-size 8192 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias assistant
@@ -157,7 +162,7 @@ models:
       -m ${models_dir}/LFM2-8B-A1B-Q4_K_M.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 16384 ${kv_args}
+      --ctx-size 8192 ${kv_args}
       ${gen_args}
       --alias reasoner
       --load-mode mmap
