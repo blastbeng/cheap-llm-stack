@@ -55,29 +55,31 @@ routing:
           persistent: true
           members:
             - embedding-model
-            - router-0.6b
             - reasoner
-        # Vision and deep thinking are one-at-a-time and loadable on demand.
-        # Measured anon cost (not reclaimable) is what decides this split:
-        #   reasoner 5.0 GB, assistant 2.0 GB, vision-docs ~2 GB, deep ~1.5 GB
-        # so keeping the MoE resident and one VLM on top = ~9 GB anon, which fits;
-        # all four at once = 12.5 GB and the board swaps itself to death.
+        # Everything else is one-at-a-time and loads on demand. Measured anon cost
+        # (not reclaimable) is what decides this split:
+        #   reasoner 4.9 GB, assistant 2.1 GB, vision-docs 2.4 GB, router-0.6b 0.9 GB
+        # MoE + embedding resident (5.7 GB) leaves room for one heavy model with real
+        # headroom; keeping the 0.6B and a VLM resident too meant 8.7 GB of anon,
+        # 5.4 GB of zram swap and 226 MB available — the kernel then swapped the
+        # router out entirely and 2 GB of the MoE's KV with it.
         heavy:
           swap: true
           exclusive: false
           persistent: false
           members:
+            - router-0.6b
             - assistant
             - deep
             - vision-docs
 
 hooks:
   on_startup:
-    # Everything a normal turn needs is already hot: embeddings, the 0.6B fast tier,
-    # the VLM (vision) and the MoE workhorse. deep/vision-docs stay cold on purpose.
+    # Only what must never be cold: the mandatory embedding model and the MoE
+    # workhorse. Vision, the fast tier and deep thinking load on first use (their
+    # weights stay in page cache, so that costs seconds, not a 40 s microSD read).
     preload:
       - embedding-model
-      - router-0.6b
       - reasoner
 
 models:
@@ -105,8 +107,10 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model kept warm: one-line answers, classification, rewrite/cleanup.
-  # 16.8 tok/s ≈ 1.6x the MoE, so it is still worth having for trivial turns.
+  # Tiny model for one-line answers: 16.8 tok/s vs 10.7 for the MoE, i.e. ~2 s saved
+  # on a 60-token reply. That is not worth 1.5 GB of permanent RAM on a 12 GB board,
+  # so it is a heavy-group member: loaded on the first trivial request and kept
+  # (ttl 0) until a vision/deep request swaps it out.
   router-0.6b:
     name: "Qwen3-0.6B · fast tier · 16.8 tok/s"
     cmd: >

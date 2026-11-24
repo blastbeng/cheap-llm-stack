@@ -154,6 +154,14 @@ SHORT_HINT_RE = re.compile(
     r"|che|chi|quando|dove|quanto|quanti|definisci|converti)\b",
     re.IGNORECASE,
 )
+# Anything that asks for an explanation, a comparison or a why/how does NOT belong on
+# the 0.6B: asked to explain a MoE it answered "Un MoE (Moyen d'Équipe)" — 2 s of
+# latency saved are not worth a hallucinated acronym.
+EXPLAIN_RE = re.compile(
+    r"\b(explain|describe|summar|compare|difference|why|how (does|do|is|are)|tell me about"
+    r"|spiega|spiegami|descrivi|riassum|confronta|differenza|perch[eé]|come (funziona|si)\b)",
+    re.IGNORECASE,
+)
 
 
 def log(msg: str) -> None:
@@ -357,7 +365,7 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
         return "reason", "summarize-long"
 
     # 5. trivial / short factual
-    if words <= 12 and len(text) <= 90 and SHORT_HINT_RE.search(low):
+    if words <= 12 and len(text) <= 90 and SHORT_HINT_RE.search(low) and not EXPLAIN_RE.search(text):
         return "fast", "trivial"
 
     # 6. translate of short strings -> fast tier is enough
@@ -366,6 +374,9 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
 
     # 7. semantic similarity against prototypes
     sem_route, score, margin = PROTO.best_route(text)
+    if sem_route == "fast" and (words > 12 or EXPLAIN_RE.search(text)):
+        # a short-answer prototype must not capture an explanation request
+        return DEFAULT_ROUTE, "semantic-fast-rejected"
     if sem_route and score >= SEM_THRESHOLD and margin >= SEM_MIN_MARGIN:
         return sem_route, "semantic(%.2f/%.2f)" % (score, margin)
 

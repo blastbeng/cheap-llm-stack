@@ -10,12 +10,12 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
               │      rules → embeddings → default
               ▼
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
-              ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   8k   core, always on
-              ├── router-0.6b           Qwen3-0.6B            Q8_0   8k   core, fast tier
-              ├── assistant             Qwen3.5-2B UD-Q4_K_XL 16k  text+vision  core
-              ├── reasoner              LFM2-8B-A1B  MoE Q4_K_M 16k text workhorse  heavy
-              ├── deep                  Qwen3.5-4B UD-Q4_K_XL 16k  thinking, opt-in  heavy
-              └── vision-docs           Qwen3-VL-2B  UD-Q4_K_XL 16k  OCR/tables      heavy
+              ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
+              ├── reasoner              LFM2-8B-A1B  MoE Q4_K_M 8k   CORE, text workhorse
+              ├── router-0.6b           Qwen3-0.6B            Q8_0   4k   heavy, fast tier
+              ├── assistant             Qwen3.5-2B UD-Q4_K_XL 8k   heavy, text+vision
+              ├── deep                  Qwen3.5-4B UD-Q4_K_XL 16k  heavy, thinking
+              └── vision-docs           Qwen3-VL-2B  UD-Q4_K_XL 8k   heavy, OCR/tables
 ```
 
 ## Why this shape
@@ -56,10 +56,13 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   5 GB MoE ≈ 9 GB) keeps everything a normal turn needs hot; the two cold models
   live in the `heavy` swap group so they can never push RAM into swap. After a
   first load, weights stay in page cache, so re-loading costs 1–3 s.
-* **Vision is free.** Qwen3.5-2B is natively multimodal and resident, so images
-  are answered with no swap: on a synthetic invoice `assistant` described it at
-  6.2 tok/s, while the dedicated `vision-docs` (Qwen3-VL-2B) transcribed it
-  verbatim at 7.5 tok/s.
+* **Vision works, but encoding is the cost.** Two VLMs share the heavy group:
+  `assistant` (Qwen3.5-2B, conversational) and `vision-docs` (Qwen3-VL-2B, OCR).
+  On a synthetic invoice `assistant` described it at 6.5 tok/s and `vision-docs`
+  transcribed `FATTURA N. 2026-114 / Totale: 1.284,50 EUR / 15/12/2026` verbatim
+  at 7.9 tok/s. The image encoder (mmproj ViT) is what hurts: 185 image tokens
+  took **48 s at `-t 2` and 30 s at `-t 8`**, so the VLMs alone use eight
+  threads. A repeated image is free (prompt cache); a new one costs ~30 s.
 * **The NPU is not usable.** The A733's NPU has no mainline driver, no
   `llama.cpp` backend and no `/dev/galcore`; `ggml` CPU (NEON dotprod + fp16) is
   the only path. `i8mm` is absent on A76, so the build uses
@@ -100,8 +103,16 @@ group uses plain `mmap` so its 5 GB stay reclaimable instead of forcing swap.
 
 | group | swap | members | effect |
 | --- | --- | --- | --- |
-| `core` | no, `persistent` | embedding-model, router-0.6b, assistant | always loaded, never evicted |
-| `heavy` | yes | reasoner, deep, vision-docs | one at a time ⇒ worst case ≈ 9 GB, never OOM |
+| `core` | no, `persistent` | embedding-model, reasoner | always loaded, never evicted (~5.7 GB anon) |
+| `heavy` | yes | router-0.6b, assistant, deep, vision-docs | one at a time, on demand |
+
+Why the fast tier and the VLMs are *not* resident: 12 GB sits exactly at the
+limit. With embedding + 0.6B + VLM + MoE loaded the board had 226 MB available
+and the kernel swapped the whole router-0.6b (896 MB) and 2 GB of the MoE's KV
+into zram. Resident = embedding + MoE leaves 3.7 GB available and zero swap;
+the first use of a heavy model costs a few seconds because its weights stay in
+page cache (the MoE is the exception: it copies expert tensors into anonymous
+memory, so it is preloaded and never evicted).
 
 ## Endpoints
 
