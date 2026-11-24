@@ -1,0 +1,115 @@
+# llama-swap configuration for Orange Pi Zero 3W (Allwinner A733, 12 GB RAM)
+# Router: capacity  -> hard RAM budget so we never OOM the board.
+# Always-online embedding is preloaded and given a high evict_cost so it is
+# never unloaded. Chat models swap in/out by memory demand.
+#
+# Model aliases (what clients call):
+#   embedding-model   -> Qwen3-Embedding-0.6B (always online, 32k ctx)
+#   qwen3.5-0.8b      -> Qwen3.5-0.8B-MTP (vision, fast)
+#   qwen3.5-2b        -> Qwen3.5-2B-MTP   (primary chat + reasoning + vision)
+#   qwen3.5-4b        -> Qwen3.5-4B       (quality, hot-swap on demand)
+#
+# All chat models are pinned to the 2 fast Cortex-A76 cores with -t 2 -tb 8.
+# Max context is 196608 (192K) for chat models; embedding keeps its native 32k.
+
+healthCheckTimeout: 120
+logLevel: info
+logToStdout: "both"
+startPort: 10001
+globalConcurrencyLimit: 4
+
+routing:
+  router:
+    use: capacity
+    settings:
+      capacity:
+        pools:
+          # 11000 MB RAM budget (board has 12 GB; leave headroom for OS/swap).
+          ram: 11000
+
+macros:
+  models_dir: /opt/cheap-llm-stack/models
+  llama_bin: /opt/cheap-llm-stack/llama.cpp/build/bin/llama-server
+  # 2 threads for generation (A76 cores), 8 for prompt processing.
+  gen_args: "--n-th 2 --tb 8"
+  ctx: 196608
+
+models:
+  embedding-model:
+    description: Qwen3-Embedding-0.6B (always-online, 1024-dim, 32k ctx)
+    # Native 32k context; do NOT force 196608 on the embedding model.
+    cmd: >-
+      ${llama_bin}
+      -m ${models_dir}/Qwen3-Embedding-0.6B-Q8_0.gguf
+      --port ${PORT}
+      --ctx-size 32768
+      --n-th 2
+      --no-chat
+    aliases:
+      - embedding-model
+    # Always resident: high evict cost keeps it in front of chat swaps.
+    evict_cost: 1000
+    capacities:
+      ram: 1500
+    preload: true
+    hooks:
+      on_proxy_start:
+        - preload:
+            - embedding-model
+
+  qwen3.5-0.8b:
+    description: Qwen3.5-0.8B-MTP (vision, fastest general chat)
+    cmd: >-
+      ${llama_bin}
+      -m ${models_dir}/Qwen3.5-0.8B-UD-Q8_K_XL.gguf
+      --mmproj ${models_dir}/Qwen3.5-0.8B-mmproj-F16.gguf
+      --port ${PORT}
+      ${gen_args}
+      --flash-attn on
+      --ctx-size ${ctx}
+    aliases:
+      - qwen3.5-0.8b
+    evict_cost: 10
+    capacities:
+      ram: 4000
+    preload: true
+
+  qwen3.5-2b:
+    description: Qwen3.5-2B-MTP (primary chat + reasoning + vision, MTP n=3)
+    cmd: >-
+      ${llama_bin}
+      -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
+      --mmproj ${models_dir}/Qwen3.5-2B-mmproj-F16.gguf
+      --port ${PORT}
+      ${gen_args}
+      --flash-attn on
+      --mtp n 3
+      --ctx-size ${ctx}
+    aliases:
+      - qwen3.5-2b
+    evict_cost: 10
+    capacities:
+      ram: 4000
+    preload: true
+
+  qwen3.5-4b:
+    description: Qwen3.5-4B (quality, hot-swap only; evicts chat models)
+    cmd: >-
+      ${llama_bin}
+      -m ${models_dir}/Qwen3.5-4B-UD-Q4_K_XL.gguf
+      --mmproj ${models_dir}/Qwen3.5-4B-mmproj-F16.gguf
+      --port ${PORT}
+      ${gen_args}
+      --flash-attn on
+      --mtp n 3
+      --ctx-size ${ctx}
+    aliases:
+      - qwen3.5-4b
+    evict_cost: 10
+    capacities:
+      ram: 6000
+
+# Load the config from the repo so systemd can start llama-swap directly.
+preload:
+  - embedding-model
+  - qwen3.5-2b

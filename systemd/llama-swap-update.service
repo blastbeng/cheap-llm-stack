@@ -1,0 +1,10 @@
+[Unit]
+Description=cheap-llm-stack llama.cpp rebuild (weekly/monthly)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/cheap-llm-stack
+ExecStart=/opt/cheap-llm-stack/update-llama.cpp.sh
