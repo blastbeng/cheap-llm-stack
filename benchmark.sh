@@ -9,7 +9,9 @@
 #
 # The pp/tg numbers from llama-bench are the ones that matter for tuning:
 # generation (tg) is bandwidth-bound and scales with the A76 cores (2 max),
-# prompt processing (pp) is compute-bound and uses all eight cores (-tb 8).
+# prompt processing (pp) is compute-bound and uses all eight cores.
+# llama-bench has no -tb switch: it is given a -t list and the best pp thread
+# count is what llama-server uses for --threads-batch.
 #
 set -euo pipefail
 
@@ -50,7 +52,7 @@ if [ "${DO_BENCH}" = 1 ]; then
         [ -s "${MODELS}/${gguf}" ] || { log "skip ${gguf} (not downloaded)"; continue; }
         log "  ${gguf}"
         "${BIN}" -m "${MODELS}/${gguf}" \
-            -t "${THREADS}" -tb "${BATCH_THREADS}" \
+            -t "${THREADS},${BATCH_THREADS}" \
             -p 512 -n 128 -r 2 -o md 2>/dev/null \
             | grep -E '^\|' || true
     done

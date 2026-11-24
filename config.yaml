@@ -120,7 +120,7 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      --reasoning auto
+      --reasoning off
       --alias assistant
       --load-mode mmap+mlock
     ttl: 0
@@ -145,7 +145,8 @@ models:
       ${thr_args}
       --ctx-size 16384 ${kv_args}
       ${gen_args}
-      --reasoning on
+      --reasoning auto
+      --reasoning-budget 512
       --alias assistant-large
       --load-mode mmap
     ttl: 1800
