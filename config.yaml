@@ -51,15 +51,18 @@ routing:
           members:
             - embedding-model
             - router-0.6b
-            - assistant
-        # Heavy models: swap:true = only one member runs at a time. That is what keeps
-        # 12 GB safe: the largest (5.6 GB MoE) or the cold pair, never both.
+            - reasoner
+        # Vision and deep thinking are one-at-a-time and loadable on demand.
+        # Measured anon cost (not reclaimable) is what decides this split:
+        #   reasoner 5.0 GB, assistant 2.0 GB, vision-docs ~2 GB, deep ~1.5 GB
+        # so keeping the MoE resident and one VLM on top = ~9 GB anon, which fits;
+        # all four at once = 12.5 GB and the board swaps itself to death.
         heavy:
           swap: true
           exclusive: false
           persistent: false
           members:
-            - reasoner
+            - assistant
             - deep
             - vision-docs
 
@@ -70,7 +73,6 @@ hooks:
     preload:
       - embedding-model
       - router-0.6b
-      - assistant
       - reasoner
 
 models:
@@ -123,10 +125,12 @@ models:
       tools: true
 
   # ---------------------------------------------------- vision workhorse (VLM) ---
-  # Qwen3.5 is natively multimodal, so ONE resident 2B covers images + text.
-  # Keeping it in the core group means a picture is answered instantly, with no swap.
+  # Qwen3.5 is natively multimodal: one 2B covers images and text. It lives in the
+  # heavy group because its vision buffers alone are 2 GB of anonymous memory, and
+  # 2 GB of VLM + 5 GB of MoE + the two 0.6B models does not fit in 12 GB (measured:
+  # 390 MB left, 5.4 GB forced into zram). First picture after a reboot pays a load.
   assistant:
-    name: "Qwen3.5-2B · text+vision · always resident"
+    name: "Qwen3.5-2B · text+vision · on demand"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
@@ -138,7 +142,7 @@ models:
       --reasoning off
       --alias assistant
       --load-mode mmap+mlock
-    ttl: 0
+    ttl: 900
     aliases:
       - qwen3.5-2b
       - vlm
@@ -152,9 +156,10 @@ models:
   # ------------------------------------------------------ text workhorse (MoE) ---
   # LFM2-8B-A1B: 8.4B total / 1.1B active. Decodes at 10.7 tok/s (dense 2B: 6.3,
   # dense 4B: 2.9) and won 5 of 6 blind-graded prompts against both, so it is the
-  # default for every non-trivial text request.
-  # load-mode mmap (not mlock): its 5 GB stay reclaimable, so the cold models and the
-  # page cache can still use RAM if they need it.
+  # default for every non-trivial text request and it is never evicted.
+  # Measured: 4.96 GB anon + 4.93 GB mapped file at ctx 2048, i.e. the MoE keeps a
+  # copy of its expert tensors in anonymous memory, so mmap does not make it cheap
+  # to reload. That is why it is preloaded and persistent: a cold load is ~100 s.
   reasoner:
     name: "LFM2-8B-A1B (MoE) · text workhorse · 10.7 tok/s"
     cmd: >
@@ -219,7 +224,7 @@ models:
       --mmproj ${models_dir}/mmproj-Qwen3-VL-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 16384 ${kv_args}
+      --ctx-size 8192 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias vision-docs
