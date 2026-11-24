@@ -78,7 +78,14 @@ apply_sysctl() {
     { echo "# managed by cheap-llm-stack scripts/tune.sh"; echo "# generated $(date -Is)"
       while IFS='=' read -r k v; do [ -n "${k}" ] && echo "${k} = ${v}"; done <<< "${SYSCTL_WANT}"
     } > "${SYSCTL_FILE}"
-    sysctl -q --system
+    # Write our own keys one by one: an unrelated drop-in in /etc/sysctl.d that
+    # names a knob this vendor kernel does not provide (e.g. net.core.default_qdisc)
+    # makes `sysctl --system` exit non-zero. Never let that abort the install.
+    while IFS='=' read -r k v; do
+        [ -z "${k}" ] && continue
+        sysctl -q -w "${k}=${v}" 2>/dev/null || warn "${k}=${v} not supported by this kernel"
+    done <<< "${SYSCTL_WANT}"
+    sysctl -q --system 2>/dev/null || warn "sysctl --system reported unsupported keys (ignored)"
     say "applied ${SYSCTL_FILE}"
 }
 
@@ -142,6 +149,16 @@ EOF
 
 # -------------------------------------------------------------------- swap ---
 check_swap() {
+    if ! command -v swapon >/dev/null 2>&1; then
+        if grep -qs zram /proc/swaps; then
+            ok "swap" "zram active ($(awk 'NR==2{print $3}' /proc/swaps) kB)"
+        elif [ -s /proc/swaps ] && [ "$(wc -l < /proc/swaps)" -gt 1 ]; then
+            warn "swap is on disk, not zram: model reloads will fight the SD card"
+        else
+            todo "swap" "no swap at all (zram recommended for 12 GB board)"
+        fi
+        return
+    fi
     if swapon --show=NAME,TYPE --noheadings | grep -q zram; then
         ok "swap" "zram active ($(swapon --show=SIZE --noheadings | head -1 | tr -d ' '))"
     elif swapon --show --noheadings | grep -q .; then
@@ -171,9 +188,11 @@ case "${MODE}" in
         ;;
     apply)
         say "applying OS-level tuning for ${STACK_DIR}"
-        apply_sysctl
-        apply_mount
-        apply_gov
+        # Each step is independently best-effort: a vendor kernel that lacks one
+        # knob must never block the stack from being deployed.
+        apply_sysctl || warn "sysctl step incomplete"
+        apply_mount  || warn "mount step incomplete (noatime not applied)"
+        apply_gov    || warn "governor step incomplete"
         check_swap || true
         systemctl set-environment CHEAP_LLM_TUNED=1 2>/dev/null || true
         echo

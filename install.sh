@@ -217,6 +217,8 @@ fi
 
 run systemctl daemon-reload
 run systemctl enable llama-swap.service llm-router.service llama-swap-update.timer
+# clear the restart counter left behind by a previously broken ExecStart
+systemctl reset-failed llama-swap.service llm-router.service 2>/dev/null || true
 run systemctl restart llama-swap.service
 run sleep 2
 run systemctl restart llm-router.service
