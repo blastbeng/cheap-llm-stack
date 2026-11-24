@@ -20,17 +20,28 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
 ## Why this shape
 
 * **Two A76 cores are the whole budget.** Generation is bound by memory
-  bandwidth on 2 threads, so bigger models are strictly slower: ~17 tok/s at
-  0.6B, ~8 tok/s at 2B, ~4 tok/s at 4B. A single 8–9B model would give ~1.5 tok/s
-  and force 4-bit quality loss — unusable interactively, so it is deliberately
-  not part of the resident set.
+  bandwidth, so bigger models are strictly slower. Measured on this exact board
+  with `llama-bench` (q8_0 KV, flash-attn on, `--threads 2`):
+
+  | model | file | tg (tok/s) | pp (tok/s) |
+  | --- | --- | --- | --- |
+  | Qwen3-0.6B Q8_0 | 0.60 GB | **16.9** | 107 (`-t 2`) |
+  | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | **6.3** | 34 (`-t 8`) |
+  | Qwen3.5-4B UD-Q4_K_XL | 2.70 GB | **3.0** | 12.7 (`-t 8`) |
+  | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | **7.5** | — |
+
+  A single 8–9B model would land at ~1.5 tok/s: one 300-token answer would take
+  over three minutes, so it is deliberately not part of the stack.
 * **Model swaps are the real cost.** Weights live on the microSD (~20–45 MB/s),
   a cold load costs 40–70 s. The stack is therefore short (5 entries) and the
   router keeps every conversation **sticky** on one model. Frequently used
   weights stay in page cache after the first load, which is why a "swap" usually
   costs 1–3 s.
 * **Vision is free.** Qwen3.5-2B is natively multimodal: one resident 2B model
-  answers text *and* images, no separate VLM in RAM.
+  answers text *and* images, no separate VLM in RAM. A second, dedicated VLM
+  (Qwen3-VL-2B) handles document-grade images: measured on a synthetic invoice,
+  `assistant` described the image at 6.2 tok/s while `vision-docs` transcribed it
+  verbatim at 7.5 tok/s.
 * **The NPU is not usable.** The A733's NPU has no mainline driver, no
   `llama.cpp` backend and no `/dev/galcore`; `ggml` CPU (NEON dotprod + fp16) is
   the only path. `i8mm` is absent on A76, so the build uses
