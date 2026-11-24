@@ -175,7 +175,7 @@ models:
     name: "LFM2-8B-A1B (MoE) · text workhorse · 10.7 tok/s"
     cmd: >
       ${llama_bin}
-      -m ${models_dir}/LFM2-8B-A1B-Q4_K_M.gguf
+      -m ${models_dir}/LFM2-8B-A1B-Q4_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
       --ctx-size 8192 ${kv_args}

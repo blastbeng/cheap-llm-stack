@@ -27,13 +27,13 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   | --- | --- | --- | --- |
   | Qwen3-0.6B Q8_0 | 0.60 GB | **16.9** | 107 (`-t 2`) |
   | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | **6.3** | 34 (`-t 8`) |
-  | **LFM2-8B-A1B (MoE) Q4_K_M** | 5.04 GB | **10.7** | 24.8 (`-t 8`) |
+  | **LFM2-8B-A1B (MoE) Q4_0** | 4.41 GB | **11.7** | 24.8 (`-t 8`) |
   | OLMoE-1B-7B q4_k_m | 4.21 GB | 13.2 | 30.6 (`-t 8`) |
   | Qwen3.5-4B UD-Q4_K_XL | 2.70 GB | 3.0 | 12.7 (`-t 8`) | not shipped |
   | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | **7.5** | — (HTTP, ~2 s/image) |
 
 * **MoE is the key finding.** `LFM2-8B-A1B` holds 8.4B of weights but activates
-  only 1.1B per token, so it decodes **10.7 tok/s — 1.7× faster than the dense
+  only 1.1B per token, so it decodes **11.7 tok/s — 1.7× faster than the dense
   2B and 3.6× faster than the dense 4B**, while being a much stronger model. On
   a bandwidth-bound board this is the only way to get 8B-class quality without
   paying 8B-class latency. A single *dense* 8–9B model would land at ~1.5 tok/s
@@ -97,7 +97,7 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
 | Qwen3-Embedding-0.6B | 0.62 GB | 1.0 GB at 8k → 0.5 GB at 4k | 4096 |
 | Qwen3-0.6B | 0.62 GB | 1.16 GB at 8k → 0.6 GB at 4k | 4096 |
 | Qwen3.5-2B + mmproj | 1.30 GB | 2.1 GB at 16k → 1.0 GB at 8k | 8192 |
-| LFM2-8B-A1B | 5.04 GB (mmap) + 0.63 resident | **5.0 GB at 16k → 1.2 GB at 8k** | 8192 |
+| LFM2-8B-A1B | 4.41 GB (mmap) + 0.63 resident | **5.0 GB at 16k → 1.2 GB at 8k** | 8192 |
 | Qwen3.5-4B + mmproj | 2.91 GB | 3.1 GB at 16k | not shipped |
 
 At 16k the four resident models needed ~12.5 GB and the board went into zram swap

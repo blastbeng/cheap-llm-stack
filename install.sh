@@ -168,7 +168,7 @@ if [ "${SKIP_MODELS}" = 0 ]; then
     fetch "unsloth/Qwen3.5-2B-GGUF" "mmproj-F16.gguf" "mmproj-Qwen3.5-2B-F16.gguf"
 
     # text workhorse: MoE, 8.4B total weights / 1.1B active per token
-    fetch "LiquidAI/LFM2-8B-A1B-GGUF" "LFM2-8B-A1B-Q4_K_M.gguf"
+    fetch "LiquidAI/LFM2-8B-A1B-GGUF" "LFM2-8B-A1B-Q4_0.gguf"
 
     # vision specialist: OCR / documents / screenshots
     fetch "unsloth/Qwen3-VL-2B-Instruct-GGUF" "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf"
