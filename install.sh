@@ -22,6 +22,12 @@
 # Environment overrides:
 #   LLAMA_CPP_TAG=v1.0.0  LLAMA_SWAP_VERSION=v275  STACK_DIR=/opt/cheap-llm-stack
 #
+# LLAMA_CPP_TAG names the exact ref to build (a tag or a 40-char sha) and is the
+# only way to force a rebuild of a specific revision. Leave it unset: an existing
+# build that starts is kept, whatever it is. The weekly updater moves this board
+# onto the tip of master, and `install.sh` for a config change must not quietly
+# rebuild v1.0.0 over it.
+#
 set -euo pipefail
 
 STACK_DIR="${STACK_DIR:-/opt/cheap-llm-stack}"
@@ -29,7 +35,12 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LLAMA_DIR="${STACK_DIR}/llama.cpp"
 MODELS_DIR="${STACK_DIR}/models"
 BIN_DIR="${STACK_DIR}/bin"
-LLAMA_CPP_TAG="${LLAMA_CPP_TAG:-v1.0.0}"
+TAG_EXPLICIT=0
+if [ -n "${LLAMA_CPP_TAG:-}" ]; then
+    TAG_EXPLICIT=1
+else
+    LLAMA_CPP_TAG="v1.0.0"
+fi
 LLAMA_SWAP_VERSION="${LLAMA_SWAP_VERSION:-v275}"
 HF_BASE="https://huggingface.co"
 
@@ -156,8 +167,12 @@ if [ "${SKIP_BUILD}" = 0 ]; then
     # A binary that cannot start (missing shared library) is not an install.
     server_ok=0
     "${BIN_DIR}/llama-server" --version >/dev/null 2>&1 && server_ok=1
-    if [ "${server_ok}" = 1 ] && [ "${installed_tag}" = "${LLAMA_CPP_TAG}" ]; then
-        log "llama.cpp ${LLAMA_CPP_TAG} already installed — skipping build"
+    # An explicit tag is a request for that revision. Without one, a binary that
+    # starts is good enough: this board follows master weekly, so the installed
+    # id is usually a sha and a comparison against the default tag would rebuild
+    # (i.e. downgrade) on every config-only install.
+    if [ "${server_ok}" = 1 ] && { [ "${TAG_EXPLICIT}" = 0 ] || [ "${installed_tag}" = "${LLAMA_CPP_TAG}" ]; }; then
+        log "llama.cpp ${installed_tag} already installed — skipping build"
     else
         build_llama "${LLAMA_CPP_TAG}"
     fi
