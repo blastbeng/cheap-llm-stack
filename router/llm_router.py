@@ -137,6 +137,10 @@ ROUTE_MODEL = {
     "embedding": "embedding-model",
 }
 
+# Every llama-swap alias that resolves to the 0.6B. A tool turn addressed to one of
+# these is redirected to the tools route (see Handler.do_POST).
+TINY_MODELS = {"router", "router-0.6b", "fast", "tiny"}
+
 # --------------------------------------------------------------- prototypes ---
 # One short utterance per intent, in English and Italian (this stack is used in
 # Italian). They are embedded once at startup with the always-on embedding model.
@@ -794,6 +798,24 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"error": {"message": "invalid json"}})
             requested = str(body.get("model") or "auto")
             if requested and requested.lower() not in ("auto", "router", "orchestrator"):
+                # A concrete id is forwarded verbatim (that is how a client debugs one
+                # tier), with one exception: a tool request must never land on the 0.6B.
+                # It emits a call 7/7 but mangles the arguments, and on a small context
+                # the schema block alone is most of the prompt. Tool orchestration lives
+                # on the MoE, so this is a redirect, not a downgrade.
+                if requested.lower() in TINY_MODELS and (
+                    has_tools(body) or has_tool_history(body.get("messages") or [])
+                ):
+                    model = ROUTE_MODEL["tools"]
+                    body["model"] = model
+                    body = apply_route_knobs(body, "tools")
+                    body = normalize_reasoning(body)
+                    bump("tools")
+                    log("route=tools model=%s by=tools-on-tiny (client asked %s)"
+                        % (model, requested))
+                    return self._forward(json.dumps(body).encode(), path, model, "tools",
+                                         "tools-on-tiny", 0.0,
+                                         body.get("reasoning_budget_tokens"))
                 return self._forward(raw, path, requested, requested, "client", 0.0)
 
             t0 = time.time()

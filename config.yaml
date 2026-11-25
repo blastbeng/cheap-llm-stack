@@ -138,7 +138,7 @@ models:
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
       --ubatch-size 256
-      --ctx-size 4096 ${kv_args}
+      --ctx-size 6144 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias router
@@ -218,7 +218,7 @@ models:
       --mmproj ${models_dir}/mmproj-LFM3-VL-2B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${vis_args}
-      --ctx-size 4096 ${kv_args}
+      --ctx-size 6144 ${kv_args}
       ${gen_args}
       --reasoning on --reasoning-budget 32
       --alias vision
