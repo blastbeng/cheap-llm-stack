@@ -21,6 +21,13 @@ Usage:
   scripts/toolcheck.py                       # all cases, via the router
   scripts/toolcheck.py --quick               # 3 cases (~1 min)
   scripts/toolcheck.py --stream              # same battery over SSE
+  scripts/toolcheck.py --seed 0              # unseeded sampling (what users get)
+
+Sampling is seeded by default: the MoE is a 1.5B-active model at temperature 0.2 and
+one case of seven flips between runs (the Telegram case did, once, in production),
+which makes a regression check useless. A fixed seed makes 7/7 mean "the build is
+fine" rather than "this draw was lucky".
+
   scripts/toolcheck.py --url http://host:10000 --model auto
 
 Exit code 0 when every case passes.
@@ -123,6 +130,7 @@ def main() -> int:
     ap.add_argument("--quick", action="store_true", help="only the three decisive cases")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--timeout", type=float, default=600.0)
+    ap.add_argument("--seed", type=int, default=1234, help="0 = let the server sample")
     args = ap.parse_args()
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
@@ -133,6 +141,8 @@ def main() -> int:
         payload = {"model": args.model, "messages": [{"role": "user", "content": prompt}],
                    "tools": TOOLS, "tool_choice": "auto", "temperature": 0.2,
                    "max_tokens": 400}
+        if args.seed:
+            payload["seed"] = args.seed
         if args.stream:
             payload["stream"] = True
         t0 = time.time()
