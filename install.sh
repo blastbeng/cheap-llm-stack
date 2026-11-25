@@ -78,38 +78,71 @@ run apt-get install -y --no-install-recommends \
 fi
 
 # ---------------------------------------------------------------------------
-# 2. llama.cpp (CPU only, armv8.2-a + dotprod + fp16 — this SoC has NO i8mm)
+# 2. llama.cpp (CPU only — this SoC has no i8mm/SVE and no usable NPU)
 # ---------------------------------------------------------------------------
+# Measured on this board (llama-bench, LFM2-8B-A1B Q4_0, q8_0 KV, -fa on):
+#
+#   -march=armv8.2-a+dotprod+fp16   t2: pp512 22.2  tg96 11.7 | t8: pp512 35.0  tg96 9.8
+#   GGML_NATIVE=ON (cortex-a76/55)  t2: pp512 22.1  tg96 11.7 | t8: pp512 34.8  tg96 9.8
+#   GGML_CPU_KLEIDIAI=ON            t2: pp512 21.8  tg96 11.7 | t8: pp512 33.0  tg96 9.7
+#
+# So: the explicit arch flag is kept (as fast as -mcpu=native and independent of
+# the toolchain's idea of "native"), and KleidiAI is *not* used — its int8
+# micro-kernels need i8mm to beat ggml's own repack, and A76 here has none.
+# ggml's runtime repack stays enabled: it is worth ~+24% prompt processing.
+LLAMA_BUILD_DIR="${STACK_DIR}/.llama-build"
+LLAMA_CMAKE_FLAGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DGGML_OPENMP=ON
+    -DGGML_NATIVE=OFF
+    -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+    -DGGML_CUDA=OFF
+    -DGGML_VULKAN=OFF
+    -DGGML_HIP=OFF
+    -DLLAMA_CURL=OFF
+    -DLLAMA_BUILD_TESTS=OFF
+    -DLLAMA_USE_PREBUILT_UI=OFF
+    -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_SERVER=ON
+    # v1.0.0 links the tools against shared ggml/llama libraries and resolves
+    # them through RUNPATH, which defaults to the *build* directory. Pinning it
+    # to $ORIGIN makes the binaries run from ${BIN_DIR} with their libraries
+    # copied next to them, and keeps the copy portable.
+    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+    -DCMAKE_INSTALL_RPATH=\$ORIGIN
+)
+
 build_llama() {
     local tag="$1"
-    log "Building llama.cpp ${tag} (CPU only, A76/A55 optimised)..."
+    log "Building llama.cpp ${tag} (CPU only, A76/A55: armv8.2-a+dotprod+fp16)..."
     run rm -rf "${LLAMA_DIR}"
     run git clone --depth 1 --branch "${tag}" \
         https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
-    run cmake -S "${LLAMA_DIR}" -B "${LLAMA_DIR}/build" -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_OPENMP=ON \
-        -DGGML_NATIVE=OFF \
-        -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 \
-        -DGGML_CUDA=OFF \
-        -DGGML_VULKAN=OFF \
-        -DGGML_HIP=OFF \
-        -DLLAMA_CURL=OFF \
-        -DLLAMA_BUILD_TESTS=OFF \
-        -DLLAMA_USE_PREBUILT_UI=OFF \
-        -DLLAMA_BUILD_EXAMPLES=OFF \
-        -DLLAMA_BUILD_SERVER=ON
-    run cmake --build "${LLAMA_DIR}/build" --config Release -j"$(nproc)"
-    run install -m 0755 "${LLAMA_DIR}/build/bin/llama-server" "${BIN_DIR}/llama-server"
-    run install -m 0755 "${LLAMA_DIR}/build/bin/llama-bench"  "${BIN_DIR}/llama-bench"
-    [ -x "${LLAMA_DIR}/build/bin/llama-cli" ] && \
-        run install -m 0755 "${LLAMA_DIR}/build/bin/llama-cli" "${BIN_DIR}/llama-cli"
+    # Out-of-tree build: the clone stays pristine, and no leftover root-owned
+    # CMake cache can wedge a later rebuild.
+    run rm -rf "${LLAMA_BUILD_DIR}"
+    run mkdir -p "${LLAMA_BUILD_DIR}"
+    run cmake -S "${LLAMA_DIR}" -B "${LLAMA_BUILD_DIR}" -G Ninja \
+        "${LLAMA_CMAKE_FLAGS[@]}"
+    run cmake --build "${LLAMA_BUILD_DIR}" --config Release -j"$(nproc)"
+    # The shared libraries are part of the install: without them the binaries
+    # die with "libllama-server-impl.so: cannot open shared object file".
+    if compgen -G "${LLAMA_BUILD_DIR}/bin/*.so*" >/dev/null; then
+        run sh -c "cp -a '${LLAMA_BUILD_DIR}/bin/'*.so* '${BIN_DIR}/'"
+    fi
+    run install -m 0755 "${LLAMA_BUILD_DIR}/bin/llama-server" "${BIN_DIR}/llama-server"
+    run install -m 0755 "${LLAMA_BUILD_DIR}/bin/llama-bench"  "${BIN_DIR}/llama-bench"
+    [ -x "${LLAMA_BUILD_DIR}/bin/llama-cli" ] && \
+        run install -m 0755 "${LLAMA_BUILD_DIR}/bin/llama-cli" "${BIN_DIR}/llama-cli"
     run sh -c "echo '${tag}' > '${STACK_DIR}/.llama-cpp-version'"
 }
 
 if [ "${SKIP_BUILD}" = 0 ]; then
     installed_tag="$(cat "${STACK_DIR}/.llama-cpp-version" 2>/dev/null || echo none)"
-    if [ -x "${BIN_DIR}/llama-server" ] && [ "${installed_tag}" = "${LLAMA_CPP_TAG}" ]; then
+    # A binary that cannot start (missing shared library) is not an install.
+    server_ok=0
+    "${BIN_DIR}/llama-server" --version >/dev/null 2>&1 && server_ok=1
+    if [ "${server_ok}" = 1 ] && [ "${installed_tag}" = "${LLAMA_CPP_TAG}" ]; then
         log "llama.cpp ${LLAMA_CPP_TAG} already installed — skipping build"
     else
         build_llama "${LLAMA_CPP_TAG}"

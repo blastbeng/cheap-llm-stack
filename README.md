@@ -73,8 +73,20 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   threads. A repeated image is free (prompt cache); a new one costs ~30 s.
 * **The NPU is not usable.** The A733's NPU has no mainline driver, no
   `llama.cpp` backend and no `/dev/galcore`; `ggml` CPU (NEON dotprod + fp16) is
-  the only path. `i8mm` is absent on A76, so the build uses
+  the only path. `i8mm` and `SVE` are absent, so the build pins
   `-march=armv8.2-a+dotprod+fp16`.
+* **Two build experiments, both rejected by measurement** (llama-bench on
+  LFM2-8B-A1B Q4_0, q8_0 KV, `-fa on`):
+
+  | build | t2 pp512 | t2 tg96 | t8 pp512 | t8 tg96 |
+  | --- | --- | --- | --- | --- |
+  | `armv8.2-a+dotprod+fp16` (shipped) | **22.2** | **11.7** | **35.0** | **9.8** |
+  | `GGML_NATIVE=ON` (cortex-a76.cortex-a55) | 22.1 | 11.7 | 34.8 | 9.8 |
+  | above + `GGML_CPU_KLEIDIAI=ON` | 21.8 | 11.7 | 33.0 | 9.7 |
+
+  KleidiAI's int8 micro-kernels need `i8mm` to beat ggml's own repack, and this
+  A76 has none, so it is off. `--ubatch-size` was swept too: 256 and 128 are
+  slower than the default 512.
 
 ## Measured settings
 

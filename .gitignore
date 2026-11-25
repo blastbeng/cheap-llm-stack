@@ -1,3 +1,12 @@
 .aider*
 
 .env
+
+# board-local artefacts: the llama.cpp clone, the out-of-tree build, the
+# installed binaries and the ~10 GB of GGUF models never belong in the repo
+/llama.cpp/
+/.llama-build/
+/bin/
+/models/
+/.llama-cpp-version
+*.log
