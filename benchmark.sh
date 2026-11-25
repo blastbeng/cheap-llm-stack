@@ -45,9 +45,8 @@ if [ "${DO_BENCH}" = 1 ]; then
     for gguf in \
         "Qwen3-Embedding-0.6B-Q8_0.gguf" \
         "Qwen3-0.6B-Q8_0.gguf" \
-        "Qwen3.5-2B-UD-Q4_K_XL.gguf" \
-        "LFM2-8B-A1B-Q4_0.gguf" \
-        "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf"
+        "LFM2.5-8B-A1B-Q4_0.gguf" \
+        "LFM3-VL-2B-QAD-Q4_0.gguf"
     do
         [ -s "${MODELS}/${gguf}" ] || { log "skip ${gguf} (not downloaded)"; continue; }
         log "  ${gguf}"

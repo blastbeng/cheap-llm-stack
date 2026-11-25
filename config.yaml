@@ -4,18 +4,24 @@
 # Design rules (measured, see README):
 #   * generation threads = 2 (one per A76); batch/prefill threads = 8 (all cores). Never raise -t above 2.
 #   * KV cache is quantized to q8_0 (needs --flash-attn on) => half the KV footprint.
-#   * context is sized to what this board can actually prefill: an 8k prompt costs
-#     ~5 minutes of prefill at 25 tok/s, so bigger windows would only burn RAM.
-#     The MoE is full-attention, which makes its KV expensive (~150 KB/token q8):
-#     8k ctx keeps it at ~1.2 GB; 16k would have cost 2.4 GB and pushed the board
-#     into zram swap (measured: 5 GB anon for the MoE at 16k).
-#   * the text workhorse is a Mixture-of-Experts (LFM2-8B-A1B): 8B total weights but only
-#     1.1B active per token, so it decodes at 10.7 tok/s — faster than the dense 2B (6.3 tok/s)
-#     and better on every blind-graded prompt. On a bandwidth-bound board MoE is a free win.
-#   * resident set: embedding + the MoE ≈ 5.7 GB, leaving ~3.5 GB of page cache for the
-#     cold models (router / assistant / vision-docs) so a swap is seconds, not a microSD read.
-#   * no 4B tier: see the note before the vision specialist. At 2.9 tok/s every thinking
-#     request cost 170 s, and using it evicted the MoE, which then needed ~120 s to return.
+#   * context 12288: measured against 8192 on the workhorse it costs +20 MB of anonymous
+#     memory and 0.00 tok/s of decode speed (10.32 vs 10.31 t/s), so the extra 4k of
+#     conversation room — which an agent client burns fast with tool schemas and
+#     tool results — is free. Do not raise it further: an 8k prompt already costs
+#     ~5 minutes of prefill at ~25 tok/s, and the KV only grows the anon set.
+#   * the text workhorse is a Mixture-of-Experts (LFM2.5-8B-A1B): 8.3B total weights but
+#     only ~1.5B active per token, so it decodes at ~10.4 tok/s — faster than the dense 2B
+#     (6.3 tok/s) and better on every blind-graded prompt. On a bandwidth-bound board MoE
+#     is a free win.
+#   * the same MoE is the tool-calling model: 7/7 on the 7-case OpenAI-style battery
+#     (5 tools, parallel calls, negative case) at reasoning_budget_tokens=32, 17.9 s per
+#     call. Its predecessor LFM2-8B-A1B scored 1/7 — it never emitted tool_calls at all.
+#     Budget 0 is NOT usable: the thinking then leaks into `content` (5/7, 52 s/call).
+#   * one VLM covers images: LFM3-VL-2B reads the same invoice text as Qwen3-VL-2B in
+#     24 s vs 113 s and takes 1.25 GB instead of 2.4 GB. It replaces both the old
+#     Qwen3.5-2B "assistant" and the Qwen3-VL-2B "vision-docs".
+#   * resident set: embedding + 0.6B + MoE ≈ 6.5 GB, leaving several GB of page cache
+#     for the VLM so a swap is seconds, not a microSD read.
 #   * never swap the embedding model: it is in the "core" group with persistent: true.
 
 healthCheckTimeout: 300          # first load from microSD can take a while
@@ -35,7 +41,9 @@ macros:
   # parallel 1: llama.cpp allocates one compute-buffer set per slot, and this board
   # serves one request at a time. The default of 4 cost ~1 GB per model (measured:
   # Qwen3-0.6B 1.79 GB -> 0.96 GB, Qwen3.5-2B 3.53 GB -> 2.4 GB). That is what makes
-  # four resident models + the 5 GB MoE fit in 12 GB.
+  # four resident models + the MoE fit in 12 GB. One slot also keeps the prompt cache
+  # for the tool schema block alive between turns, which is what makes agent clients
+  # usable here (a 1k-token tools+system prefix cost 43 s cold, 4-6 s warm).
   thr_args: --threads 2 --threads-batch 8 --parallel 1
   # Vision models are the exception: the image encoder (mmproj/ViT) runs on the
   # same thread pool and it dominates the cost — 181 image tokens took 48 s at
@@ -50,38 +58,32 @@ routing:
     settings:
       groups:
         # Always resident (swap:false = all members run together, persistent = never evicted).
-        # exclusive:false so that loading a heavy model never unloads this group.
+        # exclusive:false so that loading the VLM never unloads this group.
+        #   embedding 0.7 GB + router-0.6b 0.96 GB + reasoner ~6.4 GB at 12k ctx
         core:
           swap: false
           exclusive: false
           persistent: true
           members:
             - embedding-model
+            - router-0.6b
             - reasoner
-        # Everything else is one-at-a-time and loads on demand. Measured anon cost
-        # (not reclaimable) is what decides this split:
-        #   reasoner 4.9 GB, assistant 2.1 GB, vision-docs 2.4 GB, router-0.6b 0.9 GB
-        # MoE + embedding resident (5.7 GB) leaves room for one heavy model with real
-        # headroom; keeping the 0.6B and a VLM resident too meant 8.7 GB of anon,
-        # 5.4 GB of zram swap and 226 MB available — the kernel then swapped the
-        # router out entirely and 2 GB of the MoE's KV with it.
+        # The VLM is one-at-a-time and loads on demand: its vision buffers are the
+        # largest anonymous allocation after the MoE, and keeping it resident too
+        # pushed this board into zram swap in an earlier iteration.
         heavy:
           swap: true
           exclusive: false
           persistent: false
           members:
-            - router-0.6b
-            - assistant
-            - vision-docs
+            - vision
 
 hooks:
   on_startup:
     # Only what must never be cold: the mandatory embedding model, the MoE
-    # workhorse, and the fast tier. The fast tier is not persistent (a vision
-    # load evicts it), but preloading it means a cold 0.62 GB microSD read never
-    # lands on a user request: measured, the first "ciao" after a reboot spent
-    # 141 s waiting for the 0.6B to load, versus 13 s once its weights are in
-    # page cache. After an eviction the same warm reload applies.
+    # workhorse (default + tool calling) and the fast tier. Preloading the fast
+    # tier matters: measured, the first "ciao" after a reboot spent 141 s waiting
+    # for the 0.6B to load instead of 13 s once its weights were in page cache.
     preload:
       - embedding-model
       - reasoner
@@ -91,7 +93,7 @@ models:
 
   # ---------------------------------------------------------------- mandatory ---
   embedding-model:
-    name: "Qwen3-Embedding-0.6B · always online · 8k"
+    name: "Qwen3-Embedding-0.6B · always online · 4k"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3-Embedding-0.6B-Q8_0.gguf
@@ -112,13 +114,12 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model for one-line answers: 16.8 tok/s vs 11.7 for the MoE, i.e. ~2 s saved
-  # on a 60-token reply. Not worth 1.5 GB of permanent RAM on a 12 GB board, so it
-  # stays a heavy-group member, but it *is* preloaded: it answers the most frequent
-  # requests (greetings, one-liners), and paying its cold load on the first such
-  # request cost 141 s. ttl 0 keeps it until a vision request swaps it out.
+  # Tiny model for one-line answers: ~16 tok/s vs ~10.4 for the MoE, i.e. ~2 s saved
+  # on a 60-token reply. It must never see a tool request: it does emit tool_calls
+  # (7/7) but mangles the arguments and writes poor prose, so the router keeps
+  # `tools` on the MoE and only sends greetings, one-liners and short translations here.
   router-0.6b:
-    name: "Qwen3-0.6B · fast tier · 16.8 tok/s"
+    name: "Qwen3-0.6B · fast tier · chitchat only"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
@@ -140,62 +141,37 @@ models:
       out: [text]
       tools: true
 
-  # ---------------------------------------------------- vision workhorse (VLM) ---
-  # Qwen3.5 is natively multimodal: one 2B covers images and text. It lives in the
-  # heavy group because its vision buffers alone are 2 GB of anonymous memory, and
-  # 2 GB of VLM + 5 GB of MoE + the two 0.6B models does not fit in 12 GB (measured:
-  # 390 MB left, 5.4 GB forced into zram). First picture after a reboot pays a load.
-  # Context is 4096 rather than 8192: a single image is a few hundred tokens and the
-  # VLM's KV is the most expensive allocation here, so 4096 holds a full-page image
-  # plus a long instruction at half the anonymous cost.
-  assistant:
-    name: "Qwen3.5-2B · text+vision · on demand"
-    cmd: >
-      ${llama_bin}
-      -m ${models_dir}/Qwen3.5-2B-UD-Q4_K_XL.gguf
-      --mmproj ${models_dir}/mmproj-Qwen3.5-2B-F16.gguf
-      --host 127.0.0.1 --port ${PORT}
-      ${vis_args}
-      --ctx-size 4096 ${kv_args}
-      ${gen_args}
-      --reasoning off
-      --alias assistant
-      --load-mode mmap
-    ttl: 600
-    aliases:
-      - qwen3.5-2b
-      - vlm
-      - vision
-    checkEndpoint: /health
-    capabilities:
-      in: [text, image]
-      out: [text]
-      tools: true
-
-  # ------------------------------------------------------ text workhorse (MoE) ---
-  # LFM2-8B-A1B: 8.4B total / 1.1B active. Decodes at 10.7 tok/s (dense 2B: 6.3,
-  # dense 4B: 2.9) and won 5 of 6 blind-graded prompts against both, so it is the
-  # default for every non-trivial text request and it is never evicted.
-  # Measured: 4.96 GB anon + 4.93 GB mapped file at ctx 2048, i.e. the MoE keeps a
-  # copy of its expert tensors in anonymous memory, so mmap does not make it cheap
-  # to reload. That is why it is preloaded and persistent: a cold load is ~100 s.
+  # ------------------------------------------- text workhorse + agent (MoE) ---
+  # LFM2.5-8B-A1B: 8.3B total / ~1.5B active. Decodes at ~10.4 tok/s (dense 2B: 6.3,
+  # dense 4B: 2.9) and won the blind-graded quality battery, so it is the default for
+  # every non-trivial text request.
+  # --reasoning-budget 32 is the measured sweet spot for tool calling: 7/7 in 17.9 s
+  # per call, versus 7/7 in 24.1 s at 96 and 5/7 at 0 (where the thinking spills into
+  # `content`). The router overrides it per request (route `reason` gets 256) and
+  # keeps it bounded for plain chat so `content` never carries the monologue.
+  # ttl 0: this model must never be evicted — a cold load costs ~100 s of microSD and
+  # an eviction also throws away the tool-schema prompt cache. (An earlier `ttl: 1800`
+  # silently unloaded it in the middle of the night.)
   reasoner:
-    name: "LFM2-8B-A1B (MoE) · text workhorse · 11.7 tok/s"
+    name: "LFM2.5-8B-A1B (MoE) · text + tools · 10.4 tok/s"
     cmd: >
       ${llama_bin}
-      -m ${models_dir}/LFM2-8B-A1B-Q4_0.gguf
+      -m ${models_dir}/LFM2.5-8B-A1B-Q4_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 8192 ${kv_args}
+      --ctx-size 12288 ${kv_args}
       ${gen_args}
+      --reasoning on --reasoning-budget 32
       --alias reasoner
       --load-mode mmap
-    ttl: 1800
+    ttl: 0
     aliases:
       - default
       - moe
       - lfm2
-      - auto
+      - agent
+      - tools
+      - assistant
     checkEndpoint: /health
     capabilities:
       in: [text]
@@ -206,28 +182,37 @@ models:
   # and a 2B at ~6 tok/s, so any request that reasons before answering costs 80-170 s
   # no matter how the budget is set (measured: 4B + budget 256 = 170 s; 2B + budget 96
   # still produced 500 tokens = 83 s). On a board nobody will sit and wait for, that
-  # is not a tier, it is a trap — and every use of it evicts the MoE, which then needs
-  # ~120 s to come back from microSD. The MoE answers the same questions correctly in
-  # ~11 s without a visible thinking pass, so it simply *is* the quality tier.
+  # is not a tier, it is a trap — and every use of it evicted the MoE. The MoE answers
+  # the same questions correctly in ~11 s, so it simply *is* the quality tier.
 
-  # ------------------------------------------------------- vision specialist ---
-  # Dedicated VLM for OCR, tables, screenshots, diagrams. Not preloaded:
-  # it is chosen only when the router detects a document-grade image task.
-  vision-docs:
-    name: "Qwen3-VL-2B · OCR / documents / screenshots"
+  # ------------------------------------------------------- vision (VLM) ---
+  # LFM3-VL-2B: one model for descriptions, OCR, tables and screenshots.
+  # Measured against the two it replaces on the same invoice: identical OCR text in
+  # 24.0 s vs 113.4 s (Qwen3-VL-2B) and 24.8 s vs 145.7 s (Qwen3.5-2B) for a
+  # description, at 1.25 GB of weights instead of ~2.4 GB per model.
+  # It also handles tools (6/7 on the battery), which is what lets an agent client
+  # attach an image *and* tools to the same turn.
+  # Budget 32 keeps the answer in `content`: with reasoning disabled the model leaks
+  # its monologue ("The user asks: ...") into the reply.
+  vision:
+    name: "LFM3-VL-2B · images / OCR / screenshots · on demand"
     cmd: >
       ${llama_bin}
-      -m ${models_dir}/Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf
-      --mmproj ${models_dir}/mmproj-Qwen3-VL-2B-F16.gguf
+      -m ${models_dir}/LFM3-VL-2B-QAD-Q4_0.gguf
+      --mmproj ${models_dir}/mmproj-LFM3-VL-2B-Q8_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${vis_args}
       --ctx-size 4096 ${kv_args}
       ${gen_args}
-      --reasoning off
-      --alias vision-docs
+      --reasoning on --reasoning-budget 32
+      --alias vision
+      --load-mode mmap
     ttl: 900
     aliases:
+      - vlm
       - ocr
+      - vision-docs
+      - vision-ocr
     checkEndpoint: /health
     capabilities:
       in: [text, image]

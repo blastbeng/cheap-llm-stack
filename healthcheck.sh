@@ -3,6 +3,9 @@
 # healthcheck.sh - one glance at the whole stack.
 #   router (:10000) -> llama-swap (:10001) -> models
 #
+#   ./healthcheck.sh            # endpoints, models, embeddings, vision, services
+#   ./healthcheck.sh --tools    # also the 7-case tool-calling battery (~2 min)
+#
 set -uo pipefail
 
 ROUTER="${ROUTER_URL:-http://127.0.0.1:10000}"
@@ -40,7 +43,8 @@ try:
     ids = [m["id"] for m in json.load(sys.stdin)["data"]]
     for i in ids:
         print("  -", i)
-    missing = [m for m in ("embedding-model", "router-0.6b", "assistant") if m not in ids]
+    missing = [m for m in ("auto", "embedding-model", "router-0.6b", "reasoner", "vision")
+               if m not in ids]
     if missing:
         print("  [FAIL] not configured:", ", ".join(missing)); sys.exit(1)
 except Exception as exc:
@@ -56,11 +60,20 @@ fi
 
 echo "vision"
 if curl -fsS --max-time 300 "${ROUTER}/v1/chat/completions" -H 'Content-Type: application/json' \
-     -d '{"model":"assistant","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"ok?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="}}]}]}' \
+     -d '{"model":"vision","max_tokens":1,"messages":[{"role":"user","content":[{"type":"text","text":"ok?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg=="}}]}]}' \
      >/dev/null 2>&1; then
-    echo "  [ok]   assistant accepts image_url"
+    echo "  [ok]   vision accepts image_url"
 else
     echo "  [FAIL] vision request"; fail=1
+fi
+
+if [ "${1:-}" = "--tools" ]; then
+    echo "tool calling (7 cases, via the router)"
+    if [ -x "${0%/*}/scripts/toolcheck.py" ]; then
+        "${0%/*}/scripts/toolcheck.py" --url "${ROUTER}" || fail=1
+    else
+        python3 "$(dirname "$0")/scripts/toolcheck.py" --url "${ROUTER}" || fail=1
+    fi
 fi
 
 echo "services"

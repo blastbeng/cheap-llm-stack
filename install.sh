@@ -16,6 +16,7 @@
 #   sudo ./install.sh --skip-models    # reinstall binaries/config only
 #   sudo ./install.sh --skip-build     # reuse the existing llama.cpp build
 #   sudo ./install.sh --tune           # also apply sysctl/IO/CPU tuning
+#   sudo ./install.sh --prune-models   # delete GGUFs that are not part of the stack
 #   sudo ./install.sh --dry-run        # print actions, change nothing
 #
 # Environment overrides:
@@ -37,14 +38,16 @@ SKIP_MODELS=0
 SKIP_APT=0
 DO_TUNE=0
 DRY_RUN=0
+PRUNE_MODELS=0
 for arg in "$@"; do
     case "${arg}" in
-        --skip-build)  SKIP_BUILD=1 ;;
-        --skip-models) SKIP_MODELS=1 ;;
-        --no-apt)      SKIP_APT=1 ;;
-        --tune)        DO_TUNE=1 ;;
-        --dry-run)     DRY_RUN=1 ;;
-        -h|--help)     sed -n '2,30p' "$0"; exit 0 ;;
+        --skip-build)   SKIP_BUILD=1 ;;
+        --skip-models)  SKIP_MODELS=1 ;;
+        --no-apt)       SKIP_APT=1 ;;
+        --tune)         DO_TUNE=1 ;;
+        --prune-models) PRUNE_MODELS=1 ;;
+        --dry-run)      DRY_RUN=1 ;;
+        -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown option: ${arg}" >&2; exit 2 ;;
     esac
 done
@@ -189,27 +192,51 @@ fetch() { # repo remote_file local_file
         "${HF_BASE}/${repo}/resolve/main/${remote}" -o "${out}"
 }
 
+# Four models, nothing else. The list is also the prune whitelist (--prune-models).
+REQUIRED_MODELS=(
+    "Qwen3-Embedding-0.6B-Q8_0.gguf"       # embedding-model    (mandatory, always on)
+    "Qwen3-0.6B-Q8_0.gguf"                 # router-0.6b        (chitchat / trivial)
+    "LFM2.5-8B-A1B-Q4_0.gguf"              # reasoner           (default + tool calling)
+    "LFM3-VL-2B-QAD-Q4_0.gguf"             # vision             (images / OCR)
+    "mmproj-LFM3-VL-2B-Q8_0.gguf"          # vision projector
+)
+
 if [ "${SKIP_MODELS}" = 0 ]; then
     log "Downloading models into ${MODELS_DIR} (long step, resumes if interrupted)..."
 
-    # mandatory: always-on embedding model
+    # mandatory: always-on embedding model (Qwen3-Embedding-0.6B, 1024 dims)
     fetch "Qwen/Qwen3-Embedding-0.6B-GGUF" "Qwen3-Embedding-0.6B-Q8_0.gguf"
 
-    # fast tier / classifier (resident, tiny)
+    # fast tier: greetings, one-liners, short translations. Never tools.
     fetch "Qwen/Qwen3-0.6B-GGUF" "Qwen3-0.6B-Q8_0.gguf"
 
-    # default workhorse: text + vision
-    fetch "unsloth/Qwen3.5-2B-GGUF" "Qwen3.5-2B-UD-Q4_K_XL.gguf"
-    fetch "unsloth/Qwen3.5-2B-GGUF" "mmproj-F16.gguf" "mmproj-Qwen3.5-2B-F16.gguf"
+    # text workhorse + tool calling: LFM2.5 MoE, 8.3B total / ~1.5B active per token.
+    # 7/7 on the tool battery at reasoning_budget_tokens=32 (LFM2-8B-A1B: 1/7).
+    fetch "LiquidAI/LFM2.5-8B-A1B-GGUF" "LFM2.5-8B-A1B-Q4_0.gguf"
 
-    # text workhorse: MoE, 8.4B total weights / 1.1B active per token
-    fetch "LiquidAI/LFM2-8B-A1B-GGUF" "LFM2-8B-A1B-Q4_0.gguf"
-
-    # vision specialist: OCR / documents / screenshots
-    fetch "unsloth/Qwen3-VL-2B-Instruct-GGUF" "Qwen3-VL-2B-Instruct-UD-Q4_K_XL.gguf"
-    fetch "unsloth/Qwen3-VL-2B-Instruct-GGUF" "mmproj-F16.gguf" "mmproj-Qwen3-VL-2B-F16.gguf"
+    # single vision model: descriptions, OCR, tables. Same transcript as Qwen3-VL-2B
+    # in 24 s vs 113 s, at 1.25 GB instead of 2.4 GB.
+    fetch "LiquidAI/LFM3-VL-2B-GGUF" "LFM3-VL-2B-QAD-Q4_0.gguf"
+    fetch "LiquidAI/LFM3-VL-2B-GGUF" "mmproj-LFM3-VL-2B-Q8_0.gguf"
 else
     log "Skipping model downloads (--skip-models)"
+fi
+
+# Remove GGUFs that are not part of this stack (old tiers, benchmark candidates).
+# Off by default: run it explicitly with --prune-models.
+if [ "${PRUNE_MODELS}" = 1 ]; then
+    log "Pruning models that are not in use..."
+    for f in "${MODELS_DIR}"/*.gguf; do
+        [ -e "${f}" ] || continue
+        keep=0
+        for want in "${REQUIRED_MODELS[@]}"; do
+            [ "$(basename "${f}")" = "${want}" ] && keep=1
+        done
+        if [ "${keep}" = 0 ]; then
+            log "  removing $(basename "${f}") ($(du -h "${f}" | cut -f1))"
+            run rm -f "${f}"
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------

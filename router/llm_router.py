@@ -16,11 +16,24 @@ Why a router and not "one big model":
     request genuinely needs the 5 GB MoE, the OCR VLM or the thinking model.
 
 Decision cascade (fastest first):
+  0. tools in the request, or a tool result in the history -> tools (the MoE agent)
   1. explicit model in the request  -> pass through untouched (no routing at all)
-  2. images present                 -> assistant (VLM, resident) or vision-docs (OCR/table)
+  2. images present                 -> vision (single VLM) ; OCR hints only relabel it
   3. deterministic keyword rules     -> code / translate / summarize / reason / trivial
   4. embedding similarity            -> reuses the always-on embedding-model, 0 extra RAM
   5. default                         -> reasoner (MoE workhorse)
+
+Tool calling is the reason step 0 exists. An agent client (Open WebUI, or anything
+that speaks OpenAI + MCP/tools) sends `tools` on every turn and expects the same
+model to keep interpreting its own tool results, so a tool conversation must never
+be downgraded to the fast tier and must never bounce between models: the split
+decision below is made once and re-pinned in the sticky table. Measured on the
+7-case battery (5 tools, parallel calls, one negative case, IT+EN) the MoE scores
+7/7 at reasoning_budget_tokens=32, while the 0.6B scores 7/7 but mangles tool
+arguments and writes poor prose, and the previous workhorse scored 1/7.
+`reasoning_budget_tokens` is injected per route because it is the one sampling knob
+that changes behaviour here: at 0 the MoE spills its thinking into `content`
+(5/7, 52 s per call), at 32 it is 7/7 in 17.9 s, at 96 still 7/7 but 24.1 s.
 
 There is no "big model" escalation: on this board it would be a 4B at 2.9 tok/s,
 and a bounded thinking pass still costs 170 s (measured) — a tier nobody waits for.
@@ -33,7 +46,11 @@ user message, else client IP+UA) for STICKY_TTL seconds. Stickiness matters: a
 model swap costs 1-40 s depending on page-cache state, so a conversation must not
 bounce between models.
 
-Response headers: X-Route, X-Route-Model, X-Route-By, X-Route-Ms.
+Response headers: X-Route, X-Route-Model, X-Route-By, X-Route-Ms, X-Route-Budget.
+
+The router also advertises a synthetic model id, `auto`, in GET /v1/models. Without
+it a client can only pick a raw llama-swap id (assistant, reasoner, ...), which is
+passed through verbatim and therefore *bypasses* every decision above.
 """
 
 from __future__ import annotations
@@ -62,18 +79,38 @@ SEM_THRESHOLD = float(os.environ.get("ROUTER_SEM_THRESHOLD", "0.45"))
 SEM_MIN_MARGIN = float(os.environ.get("ROUTER_SEM_MARGIN", "0.02"))
 MAX_STICKY = 1024
 
+# reasoning_budget_tokens per route (llama.cpp's per-request thinking cap). -1 would
+# mean "use the server default"; we always say it explicitly so a route change is one
+# edit here and not a service restart. Values are measured, see the module docstring:
+#   32  keeps `content` clean and still reasons enough to pick tools (7/7, 17.9 s)
+#   256 for the rare "prove it / design it" request, which is the only place a long
+#       thinking pass pays for itself at 10 tok/s
+ROUTE_BUDGET = {
+    "assistant": int(os.environ.get("ROUTER_BUDGET_CHAT", "32")),
+    "reason": int(os.environ.get("ROUTER_BUDGET_REASON", "256")),
+    "tools": int(os.environ.get("ROUTER_BUDGET_TOOLS", "32")),
+    "vision": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
+    "vision-docs": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
+}
+# A tool call is ~120 tokens of reasoning + ~60 of arguments; a client that caps the
+# answer at 200 tokens truncates the call instead of the prose, which the agent then
+# never sees. Raise the ceiling on tool turns only, never lower a client's value.
+TOOLS_MIN_MAX_TOKENS = int(os.environ.get("ROUTER_TOOLS_MIN_MAX_TOKENS", "800"))
+CONTEXT_LENGTH = int(os.environ.get("ROUTER_CONTEXT_LENGTH", "12288"))
+
 DEFAULT_ROUTE = "assistant"
 
 # route -> llama-swap model id
-# "assistant" and "reason" both land on the MoE: it is the best text model on the
-# board *and* the fastest of the big ones, so there is nothing to split between a
-# small default and a quality escalation for text.
+# "assistant", "reason" and "tools" all land on the MoE: it is the best text model on
+# the board *and* the fastest of the big ones, so there is nothing to split between a
+# small default, a quality escalation and an agent tier for text.
 ROUTE_MODEL = {
     "fast": "router-0.6b",
     "assistant": "reasoner",
     "reason": "reasoner",
-    "vision": "assistant",
-    "vision-docs": "vision-docs",
+    "tools": "reasoner",
+    "vision": "vision",
+    "vision-docs": "vision",
     "embedding": "embedding-model",
 }
 
@@ -379,6 +416,70 @@ def has_image(messages: list[dict]) -> bool:
     return False
 
 
+def has_tools(body: dict) -> bool:
+    """The client offered tools on this turn."""
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        return True
+    # legacy OpenAI "functions" API, still emitted by a few clients
+    functions = body.get("functions")
+    return isinstance(functions, list) and bool(functions)
+
+
+def has_tool_history(messages: list[dict]) -> bool:
+    """A tool has already been called in this conversation (we are mid-loop)."""
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") in ("tool", "function"):
+            return True
+        if m.get("tool_calls") or m.get("function_call"):
+            return True
+        content = m.get("content")
+        if isinstance(content, list):
+            for chunk in content:
+                if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("tool"):
+                    return True
+    return False
+
+
+def normalize_reasoning(body: dict) -> dict:
+    """Stop a client from switching thinking *off* on a reasoning-only model.
+
+    LFM2.5 always thinks; asked to answer without a thinking block it writes the
+    monologue into `content` (measured: 5/7 on the tool battery, replies like
+    "The user's request is to send a message on Telegram..."). We keep the budget
+    in charge instead, which ends the block cleanly.
+    """
+    kwargs = body.get("chat_template_kwargs")
+    if isinstance(kwargs, dict) and kwargs.pop("enable_thinking", None) is False:
+        body["chat_template_kwargs"] = kwargs
+        if not kwargs:
+            body.pop("chat_template_kwargs", None)
+        log("dropped chat_template_kwargs.enable_thinking=false (budget governs thinking)")
+    if str(body.get("reasoning_effort", "")).lower() in ("none", "off", "0"):
+        body.pop("reasoning_effort", None)
+        log("dropped reasoning_effort=none (budget governs thinking)")
+    return body
+
+
+def apply_route_knobs(body: dict, route: str) -> dict:
+    """Per-route sampling knobs: thinking budget and, on tool turns, a token floor."""
+    if "reasoning_budget_tokens" not in body and "thinking_budget_tokens" not in body:
+        budget = ROUTE_BUDGET.get(route)
+        if budget is not None:
+            body["reasoning_budget_tokens"] = budget
+    if route == "tools":
+        # only raise a ceiling the client actually set; never introduce a second
+        # token-limit field next to one that is already there
+        fields = [f for f in ("max_tokens", "max_completion_tokens") if f in body] or ["max_tokens"]
+        for field in fields:
+            value = body.get(field)
+            if not isinstance(value, int) or value < TOOLS_MIN_MAX_TOKENS:
+                body[field] = TOOLS_MIN_MAX_TOKENS
+    return body
+
+
 def session_key(headers, body: dict, client_ip: str) -> str:
     sid = headers.get("X-Session-Id")
     if sid:
@@ -398,6 +499,15 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
     msgs = body.get("messages") or []
     text = message_text(msgs)
     key = session_key(headers, body, client_ip)
+
+    # 0. agent turns win over everything, including stickiness: a conversation that
+    #    started as chitchat and now carries tools must not stay on the 0.6B, and a
+    #    tool loop must keep hitting the model that issued the call (it is the model
+    #    that has to interpret its own tool results, and the one whose prompt cache
+    #    holds the tool schema block).
+    if has_tools(body) or has_tool_history(msgs):
+        sticky_put(key, "tools")
+        return "tools", "tools"
 
     sticky = sticky_get(key)
     if sticky:
@@ -497,11 +607,15 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- endpoints -------------------------------------------------------------
     def do_GET(self):
-        if self.path.startswith(("/v1/models", "/props", "/slots", "/metrics")):
+        if self.path.split("?")[0] in ("/v1/models", "/models"):
+            return self._models()
+        if self.path.startswith(("/props", "/slots", "/metrics")):
             return self._passthrough("GET", self.path)
         if self.path == "/health":
             body = {"status": "ok", "upstream": "http://%s:%d" % (UPSTREAM_HOST, UPSTREAM_PORT),
-                    "routes": ROUTE_MODEL, "prototypes_ready": PROTO.ready.is_set()}
+                    "routes": ROUTE_MODEL, "budgets": ROUTE_BUDGET,
+                    "context_length": CONTEXT_LENGTH,
+                    "prototypes_ready": PROTO.ready.is_set()}
             if not upstream_ok("/health"):
                 body["status"] = "degraded"
                 body["upstream_error"] = "llama-swap did not answer /health"
@@ -535,20 +649,27 @@ class Handler(BaseHTTPRequestHandler):
 
             t0 = time.time()
             route, why = decide(body, self.headers, self.address_string())
-            model = ROUTE_MODEL.get(route, DEFAULT_ROUTE)
+            model = ROUTE_MODEL.get(route, ROUTE_MODEL["assistant"])
             body["model"] = model
+            body = apply_route_knobs(body, route)
+            if route != "fast":
+                body = normalize_reasoning(body)
             if route == "fast":
                 body = keep_language(body)
             elapsed = (time.time() - t0) * 1000.0
             bump(route)
-            log("route=%s model=%s by=%s %.0fms" % (route, model, why, elapsed))
-            return self._forward(json.dumps(body).encode(), path, model, route, why, elapsed)
+            log("route=%s model=%s by=%s budget=%s max_tokens=%s %.0fms"
+                % (route, model, why, body.get("reasoning_budget_tokens"),
+                   body.get("max_tokens") or body.get("max_completion_tokens"), elapsed))
+            return self._forward(json.dumps(body).encode(), path, model, route, why, elapsed,
+                                 body.get("reasoning_budget_tokens"))
 
         # everything else: transparent
         return self._forward(raw, path, "passthrough", "passthrough", "passthrough", 0.0)
 
     # -- proxying --------------------------------------------------------------
-    def _forward(self, raw: bytes, path: str, model: str, route: str, why: str, ms: float):
+    def _forward(self, raw: bytes, path: str, model: str, route: str, why: str, ms: float,
+                 budget=None):
         conn, headers = self._upstream("POST", path)
         try:
             conn.request("POST", path, body=raw, headers=headers)
@@ -565,6 +686,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Route-Model", model)
         self.send_header("X-Route-By", why)
         self.send_header("X-Route-Ms", "%.1f" % ms)
+        if budget is not None:
+            self.send_header("X-Route-Budget", str(budget))
         self.send_header("X-Accel-Buffering", "no")
         streaming = "text/event-stream" in ctype or resp.getheader("Transfer-Encoding") == "chunked"
         if streaming:
@@ -591,6 +714,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _models(self):
+        """Advertise llama-swap's models plus the orchestrator itself.
+
+        Clients pick from this list, and a concrete id is forwarded verbatim, so
+        without an `auto` entry every request would bypass routing. The entry
+        declares function calling and vision because the orchestrator may pick a
+        model that has them.
+        """
+        try:
+            conn = http.client.HTTPConnection(UPSTREAM_HOST, UPSTREAM_PORT, timeout=60)
+            conn.request("GET", "/v1/models")
+            resp = conn.getresponse()
+            data = json.loads(resp.read().decode() or "{}")
+            conn.close()
+        except Exception as exc:
+            return self._json(502, {"error": {"message": "llama-swap unreachable: %s" % exc,
+                                              "type": "upstream_error"}})
+        models = data.get("data")
+        if isinstance(models, list) and not any(
+                isinstance(m, dict) and m.get("id") == "auto" for m in models):
+            models.insert(0, {
+                "id": "auto",
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "cheap-llm-stack",
+                "name": "auto · orchestrator (tools + vision, routes per request)",
+                "context_length": CONTEXT_LENGTH,
+                "capabilities": {"function_calling": True, "vision": True, "embeddings": False},
+                "supported_parameters": ["tools", "tool_choice", "parallel_tool_calls",
+                                         "reasoning_budget_tokens", "max_tokens", "stream"],
+            })
+        body = json.dumps(data).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _passthrough(self, method: str, path: str):
         try:
