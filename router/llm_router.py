@@ -33,7 +33,9 @@ decision below is made once and re-pinned in the sticky table. Measured on the
 arguments and writes poor prose, and the previous workhorse scored 1/7.
 `reasoning_budget_tokens` is injected per route because it is the one sampling knob
 that changes behaviour here: at 0 the MoE spills its thinking into `content`
-(5/7, 52 s per call), at 32 it is 7/7 in 17.9 s, at 96 still 7/7 but 24.1 s.
+(5/7, 52 s per call), at 32 it is 7/7 in 17.9 s, at 96 still 7/7 but 24.1 s — so
+tool turns keep 32, while plain chat runs at 96 because at 32 a prompt that needs a
+real plan gets its thought cut mid-sentence and the leftover shows up in `content`.
 
 There is no "big model" escalation: on this board it would be a 4B at 2.9 tok/s,
 and a bounded thinking pass still costs 170 s (measured) — a tier nobody waits for.
@@ -92,11 +94,19 @@ MAX_STICKY = 1024
 # reasoning_budget_tokens per route (llama.cpp's per-request thinking cap). -1 would
 # mean "use the server default"; we always say it explicitly so a route change is one
 # edit here and not a service restart. Values are measured, see the module docstring:
-#   32  keeps `content` clean and still reasons enough to pick tools (7/7, 17.9 s)
+#   96  for plain chat. 32 was enough for short answers but not for a prompt that
+#       needs a real plan: the cap then cuts the thought mid-sentence and the leftover
+#       is returned inside `content` (" thinking We need to answer in Italian...") —
+#       measured on "spiega passo per passo come funziona TCP" (150 ch of thought in
+#       reasoning_content, the rest dumped in content). At 96 the same prompt is clean
+#       and often *faster* (26.0 s vs 32.1 s on a Rust/Go comparison) because the
+#       model stops re-thinking; typical chat prompts cost 0-3 s more.
+#   32  for tool turns, where it is measured 7/7 at 17-19 s: a tool decision needs no
+#       plan, and every extra thinking token is a second the user waits.
 #   256 for the rare "prove it / design it" request, which is the only place a long
 #       thinking pass pays for itself at 10 tok/s
 ROUTE_BUDGET = {
-    "assistant": int(os.environ.get("ROUTER_BUDGET_CHAT", "32")),
+    "assistant": int(os.environ.get("ROUTER_BUDGET_CHAT", "96")),
     "reason": int(os.environ.get("ROUTER_BUDGET_REASON", "256")),
     "tools": int(os.environ.get("ROUTER_BUDGET_TOOLS", "32")),
     "vision": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
@@ -191,7 +201,8 @@ CODE_RE = re.compile(
 REASON_RE = re.compile(
     r"\b(prove|derive|step[ -]by[ -]step|trade-?offs?|architect(ure|ural)|root cause"
     r"|algorithm|complexity|optimi[sz]e|refactor|benchmark|dimostra|dimostrazione"
-    r"|passo passo|architettura|complessità|ottimizza|rifattorizza|causa (radice|del problema))\b",
+    r"|passo[ -]per[ -]passo|passo passo|architettura|complessità|ottimizza|rifattorizza"
+    r"|causa (radice|del problema))\b",
     re.IGNORECASE,
 )
 TRANSLATE_RE = re.compile(r"\b(translate|traduci|traduzione|in inglese|in italiano)\b", re.IGNORECASE)
@@ -560,7 +571,11 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
         return ("fast", "code-short") if tiny_ok else ("reason", "code")
 
     # 3. reasoning / design
-    if REASON_RE.search(text) and (words > 25 or len(text) > 200):
+    # 18 words / 160 chars, not 25/200: "Spiega passo per passo come funziona il
+    # protocollo TCP e perché il three-way handshake è necessario, con un esempio
+    # concreto di connessione." is 24 words / 145 chars and fell through to the
+    # default route, where the chat budget cut its thought and leaked it into content.
+    if REASON_RE.search(text) and (words > 18 or len(text) > 160):
         return "reason", "reasoning"
 
     # 4. summarization of a long input

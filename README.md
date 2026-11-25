@@ -77,8 +77,14 @@ in it goes to the VLM; embeddings are always on.
   at `0` it answers immediately but writes its monologue into `content`
   (*“The user's request is to send a message on Telegram…”*) and drops to 5/7;
   at `32` it ends the thinking block cleanly and still picks the right tool 7/7.
-  The router sets it per route: 32 for chat/tools/vision, 256 for the rare
-  `reason` request, nothing for the fast tier.
+  The router sets it per route: **96 for plain chat**, 32 for tools and vision,
+  256 for the rare `reason` request, nothing for the fast tier. Tools keep 32
+  because a tool decision needs no plan (and 96 costs 6 s per call); chat gets 96
+  because 32 cuts the thought mid-sentence on anything that needs a plan and the
+  leftover is then returned inside `content` — measured on *"spiega passo per passo
+  come funziona TCP"*: at 32, 150 chars of thought landed in `reasoning_content`
+  and the rest of the monologue in `content`; at 96 it is clean, and on typical
+  prompts it is 0–3 s *faster*, because the model stops re-thinking.
 
 * **One VLM replaced two.** `LFM3-VL-2B` reads the same synthetic invoice as the
   old `vision-docs` (Qwen3-VL-2B) in **24.0 s vs 113.4 s**, describes an image in
@@ -86,7 +92,20 @@ in it goes to the VLM; embeddings are always on.
   ~2.4 GB per model. It also does tool calls (6/7), so one turn can carry both an
   image and tools.
 
-  It is *literal* about wording, which is worth knowing before blaming the stack.
+  Image size is the knob that decides whether vision is usable. Measured, same
+  prompt, same model (tokens ≈ pixels/1000, and prefill dominates):
+
+  | image | image tokens | wall |
+  | --- | --- | --- |
+  | invoice PNG, 27 KB | 335 | 32 s (first call after the VLM was evicted: includes the load) |
+  | photo 800×600, 92 KB | 498 | 38 s |
+  | photo 1600×1200, 299 KB | **1923** | **145 s** |
+
+  So: downscale to ~1 MP (≈1000 tokens, ~60–90 s) before sending, and treat a
+  straight-from-the-phone 12 MP photo as a 10-minute request that will also eat the
+  context. It is not a bug in the stack — it is 1923 tokens of prefill at ~25 tok/s.
+
+  It is also *literal* about wording, which is worth knowing before blaming the stack.
   `Estrai: fornitore, numero, data, totale. … solo i campi` returns the four labels
   (or labels then values); the same request phrased as *"estrai i **valori** di …,
   una riga per campo, formato campo: valore"* returns all four values in 24 s,
