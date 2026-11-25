@@ -86,6 +86,13 @@ in it goes to the VLM; embeddings are always on.
   ~2.4 GB per model. It also does tool calls (6/7), so one turn can carry both an
   image and tools.
 
+  It is *literal* about wording, which is worth knowing before blaming the stack.
+  `Estrai: fornitore, numero, data, totale. … solo i campi` returns the four labels
+  (or labels then values); the same request phrased as *"estrai i **valori** di …,
+  una riga per campo, formato campo: valore"* returns all four values in 24 s,
+  deterministically. Measured: the thinking budget does not matter here (0, 32 and
+  128 produce the same extraction, 27–37 s), so vision keeps 32 like the rest.
+
 * **Agent payloads are prefill-heavy, and the prefix cache is the fix.** A real
   client sends a system prompt plus tool schemas on every turn: ~1k tokens cold
   cost **43 s** on the MoE, the next turn in the same conversation cost **28–30 s**
@@ -213,12 +220,31 @@ Tool turns are decided **before** everything else, including stickiness:
 
 The tool payload is passed through verbatim (`tools`, `tool_choice`,
 `parallel_tool_calls`), no system prompt is injected (it would shift the cached
-prefix), the thinking budget is set to 32 and the answer ceiling is raised to at
-least 800 tokens so a client's `max_tokens: 200` cannot truncate the call instead
-of the prose. A client that tries to switch thinking *off*
-(`chat_template_kwargs.enable_thinking: false`, `reasoning_effort: "none"`) is
-overruled, because on a reasoning-only model that is what pushes the monologue
-into `content`.
+prefix), the thinking budget is set to 32, the answer ceiling is raised to at least
+800 tokens so a client's `max_tokens: 200` cannot truncate the call instead of the
+prose, and **temperature is raised to 0.6** (see below). A client that tries to
+switch thinking *off* (`chat_template_kwargs.enable_thinking: false`,
+`reasoning_effort: "none"`) is overruled, because on a reasoning-only model that is
+what pushes the monologue into `content`.
+
+Why the temperature floor. Two of the seven cases are temperature-sensitive, and
+not in the direction you would guess — a *cold* sampler answers a tool request in
+prose instead of emitting the call. Measured, seed 1234, same prompt, `tg` = "manda
+un messaggio su Telegram" and `none` = "raccontami una barzelletta" (must call
+nothing):
+
+| budget | temp | tg | none | result |
+| --- | --- | --- | --- | --- |
+| 32 / 64 / 96 / 192 | 0.2 | no call | calls `web_search` | 0/2 |
+| 96 | 0.6 | ok | no call | **2/2** |
+| 32 (full 7-case battery) | 0.6 | ok | no call | **7/7**, 17–19 s/call |
+
+The budget is therefore irrelevant here (that is why it stays at 32, the fastest) and
+the floor is what fixes it. It only *raises*: a client asking for 0.8 or 1.0 keeps
+its value. `ROUTER_TOOLS_MIN_TEMPERATURE=0` disables it, which is also what makes
+"5/7 direct, 7/7 through the router" a reproducible A/B:
+`scripts/toolcheck.py --only tg,none --url http://127.0.0.1:10001 --model reasoner`
+bypasses the router, and therefore the floor, on purpose.
 
 ### Routing guards
 

@@ -151,7 +151,10 @@ models:
   # every non-trivial text request.
   # --reasoning-budget 32 is the measured sweet spot for tool calling: 7/7 in 17.9 s
   # per call, versus 7/7 in 24.1 s at 96 and 5/7 at 0 (where the thinking spills into
-  # `content`). The router overrides it per request (route `reason` gets 256) and
+  # `content`). The router also raises temperature to 0.6 on tool turns: a cold
+  # sampler answers a tool request in prose instead of emitting the call (0.2 scored
+  # 5/7 whatever the budget, 0.6 scored 7/7). The router overrides the rest per
+  # request (route `reason` gets 256) and
   # keeps it bounded for plain chat so `content` never carries the monologue.
   # ttl 0: this model must never be evicted — a cold load costs ~100 s of microSD and
   # an eviction also throws away the tool-schema prompt cache. (An earlier `ttl: 1800`

@@ -106,6 +106,9 @@ ROUTE_BUDGET = {
 # answer at 200 tokens truncates the call instead of the prose, which the agent then
 # never sees. Raise the ceiling on tool turns only, never lower a client's value.
 TOOLS_MIN_MAX_TOKENS = int(os.environ.get("ROUTER_TOOLS_MIN_MAX_TOKENS", "800"))
+# Below this the MoE answers a tool request in prose instead of emitting the call.
+# Measured, see apply_route_knobs. 0 disables the floor.
+TOOLS_MIN_TEMPERATURE = float(os.environ.get("ROUTER_TOOLS_MIN_TEMPERATURE", "0.6"))
 CONTEXT_LENGTH = int(os.environ.get("ROUTER_CONTEXT_LENGTH", "12288"))
 
 DEFAULT_ROUTE = "assistant"
@@ -474,14 +477,25 @@ def normalize_reasoning(body: dict) -> dict:
 
 
 def apply_route_knobs(body: dict, route: str) -> dict:
-    """Per-route sampling knobs: thinking budget and, on tool turns, a token floor."""
+    """Per-route sampling knobs: thinking budget, a token floor, a temperature floor."""
     if "reasoning_budget_tokens" not in body and "thinking_budget_tokens" not in body:
         budget = ROUTE_BUDGET.get(route)
         if budget is not None:
             body["reasoning_budget_tokens"] = budget
     if route == "tools":
-        # only raise a ceiling the client actually set; never introduce a second
-        # token-limit field next to one that is already there
+        # A cold sampler (0.2, the usual client default) collapses this model onto the
+        # prose continuation instead of the tool-call branch: measured on the 7-case
+        # battery at seed 1234, temperature 0.2 scored 5/7 identically on budgets
+        # 32/64/96/192, while 0.6 scored 7/7 at budget 32 — the Telegram case emitted
+        # no call at all and the joke case called web_search. So raise, never lower:
+        # a client that asks for 0.8 or 1.0 keeps it.
+        temp = body.get("temperature")
+        if isinstance(temp, (int, float)) and temp < TOOLS_MIN_TEMPERATURE:
+            body["temperature"] = TOOLS_MIN_TEMPERATURE
+            log("raised temperature %.2f -> %.2f on a tool turn"
+                % (float(temp), TOOLS_MIN_TEMPERATURE))
+        # Only raise a ceiling the client actually set; never introduce a second
+        # token-limit field next to one that is already there.
         fields = [f for f in ("max_tokens", "max_completion_tokens") if f in body] or ["max_tokens"]
         for field in fields:
             value = body.get(field)
