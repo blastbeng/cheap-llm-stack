@@ -313,21 +313,52 @@ normalise/repair in the MCP gateway) — a bigger model does not fix it.
 
 ## Open WebUI recipe
 
-1. Settings → Connections → OpenAI: base URL `http://<board>:10000/v1`,
-   API key anything (no key is set), provider hint `llama.cpp`.
-2. Pick the model **`auto`** — it is the orchestrator. Choosing `reasoner` or
-   `router` directly bypasses routing (useful for debugging, not for use).
-   `auto`, `router` and `orchestrator` are the three magic ids that mean "route
-   this"; for direct access to a model use its own id (`embedding-model`,
-   `reasoner`, `vision`) or the `router-0.6b` alias of the tiny tier.
-3. Enable native function calling on the model (Open WebUI exposes it per model
-   under Advanced Params); `/v1/models` advertises
-   `capabilities.function_calling: true`.
-4. First turn of a conversation pays the full system+tools prefill (43 s for ~1k
-   tokens). Tell the user, or keep the system prompt short — every 1k tokens of
-   system prompt costs ~30 s of prefill once.
-5. Reasoning shows up as `reasoning_content`; Open WebUI renders it as the
-   thinking block. At budget 32 it is short by design.
+In production Open WebUI does not point at the board directly: it goes through
+LiteLLM on the media host (`http://192.168.1.13:4000/v1`), so the ids it sees are
+`cheap/auto`, `cheap/router`, `cheap/reasoner`, `cheap/vision` and
+`cheap/embedding-model`. Two properties of that client are not obvious, and both
+of them bit us:
+
+* **Native function calling is expensive here and it is ON by default.** With
+  the builtin tool categories untouched, a plain `hello` carried 28 schemas and
+  **5,430 prompt tokens**; adding one MCP server made it 31 schemas and **7,640
+  tokens** — 95 % of the prompt. On a 4096-token model that is a guaranteed
+  `413 prompt_too_large`, on the 12,288-token MoE it leaves room for one turn.
+  The context limit is not the problem; the schemas are.
+* **Raising `--ctx-size` is the wrong fix.** Measured prefill on this board is
+  21–35 tok/s, so a 7.6k prompt costs 4–6 minutes *per request*. Only shrinking
+  the prompt scales.
+
+So, for every model that shadows a connection id (Workspace → Models, or
+`POST /api/v1/models/create` with `base_model_id: null` and the connection id as
+`id`):
+
+1. `meta.builtinTools` — every category `false`: `time`, `user_input`, `files`,
+   `knowledge`, `chats`, `subagents`, `memory`, `web_search`,
+   `image_generation`, `code_interpreter`, `notes`, `channels`, `skills`,
+   `tools`, `tasks`, `automations`, `calendar`, `notifications`. Keep
+   `meta.capabilities.builtin_tools` **true** — that flag also enables inlining
+   of attached file content, and with every category off it emits no schema.
+2. `meta.capabilities` — `terminal`, `web_search`, `image_generation`,
+   `code_interpreter`, `memory` false; `vision` true only on `cheap/vision`.
+3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 2 meta-tools, ~640
+   tokens, and the whole 126-tool gateway behind one search call. In Open WebUI
+   a global `inlet` filter injects that id into every chat, so `TOOL_IDS` there
+   must equal the connection's `info.id`.
+4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
+   over the prompt, and compaction cannot fit a 4k model anyway.
+
+Measured on `cheap/router` (4096) with this profile: **990 prompt tokens**,
+15.7 s first-turn prefill and **0.3 s on the following turn** — with a constant
+2-tool surface the chat prefix stays byte-identical, llama.cpp reuses its cache
+and only the new message is prefilled. That cache hit is the real payoff of a
+small tool surface, more than the tokens themselves. `cheap/auto` answers the
+same shape of request in 990 tokens and routes through the orchestrator
+(`auto` is the magic id; `reasoner`/`router` bypass routing, which is only
+useful for debugging).
+
+Reasoning shows up as `reasoning_content`; Open WebUI renders it as the thinking
+block. At budget 32 it is short by design.
 
 ## Operations
 
