@@ -148,7 +148,12 @@ TRANSLATE_RE = re.compile(r"\b(translate|traduci|traduzione|in inglese|in italia
 SUMMARY_RE = re.compile(r"\b(summar(y|ize|ise)|tl;?dr|riassum(i|ere|to)|sintesi)\b", re.IGNORECASE)
 OCR_RE = re.compile(
     r"\b(ocr|screenshot|receipt|invoice|scanned|scan\b|table|spreadsheet|csv|form\b|document"
-    r"|scontrino|ricevuta|fattura|tabella|foglio|modulo|documento)\b",
+    r"|scontrino|ricevuta|fattura|tabella|foglio|modulo|documento"
+    # reading text *out of* a picture is the document model's job even when the
+    # sentence never names a document: "trascrivi il testo, riga per riga" used
+    # to fall through to the conversational VLM, which then had to be swapped
+    # for the OCR one on the very next turn (~100 s of microSD load each way).
+    r"|trascriv\w*|transcri\w*|estrai il testo|extract text|leggi il testo|read the text)\b",
     re.IGNORECASE,
 )
 SHORT_HINT_RE = re.compile(

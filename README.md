@@ -11,10 +11,10 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
               ▼
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
               ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
-              ├── reasoner              LFM2-8B-A1B  MoE Q4_K_M 8k   CORE, text workhorse
-              ├── router-0.6b           Qwen3-0.6B            Q8_0   4k   heavy, fast tier
-              ├── assistant             Qwen3.5-2B UD-Q4_K_XL 8k   heavy, text+vision
-              └── vision-docs           Qwen3-VL-2B  UD-Q4_K_XL 8k   heavy, OCR/tables
+              ├── reasoner              LFM2-8B-A1B  MoE Q4_0   8k   CORE, text workhorse
+              ├── router-0.6b           Qwen3-0.6B            Q8_0   4k   heavy, fast tier, preloaded
+              ├── assistant             Qwen3.5-2B UD-Q4_K_XL 4k   heavy, text+vision
+              └── vision-docs           Qwen3-VL-2B  UD-Q4_K_XL 4k   heavy, OCR/tables
 ```
 
 ## Why this shape
@@ -27,10 +27,16 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   | --- | --- | --- | --- |
   | Qwen3-0.6B Q8_0 | 0.60 GB | **16.9** | 107 (`-t 2`) |
   | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | **6.3** | 34 (`-t 8`) |
-  | **LFM2-8B-A1B (MoE) Q4_0** | 4.41 GB | **11.7** | 24.8 (`-t 8`) |
-  | OLMoE-1B-7B q4_k_m | 4.21 GB | 13.2 | 30.6 (`-t 8`) |
+  | **LFM2-8B-A1B (MoE) Q4_0** | 4.41 GB | **11.7** (`-t 2`) | **35.0** (`-t 8`) |
+  | LFM2-8B-A1B (MoE) Q4_K_M | 5.04 GB | 10.7 (`-t 2`) | 25.0 (`-t 8`) | not shipped |
+  | OLMoE-1B-7B q4_k_m | 4.21 GB | 13.2 | 30.6 (`-t 8`) | not shipped |
   | Qwen3.5-4B UD-Q4_K_XL | 2.70 GB | 3.0 | 12.7 (`-t 8`) | not shipped |
-  | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | **7.5** | — (HTTP, ~2 s/image) |
+  | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | **7.5** | — (HTTP, ~2 s/image) | shipped |
+
+  The same MoE at Q4_K_M bought ~0.5 GB more quality for **−29 % prefill**
+  (25.0 vs 35.0 tok/s) and −9 % decode, so Q4_0 ships. Both quantizations were
+  re-measured after the last rebuild; the whole board runs ~7 % under the very
+  first numbers, which is board state (page cache / thermals), not the build.
 
 * **MoE is the key finding.** `LFM2-8B-A1B` holds 8.4B of weights but activates
   only 1.1B per token, so it decodes **11.7 tok/s — 1.7× faster than the dense
@@ -60,17 +66,26 @@ client ──► :10000  llm-router          semantic orchestrator (Python, stdl
   draft: 6.16 tok/s → 4.79 (n=3) → 3.09 (n=8); `ngram-*` gave no change. Draft
   verification is bandwidth-bound on the same two cores, so it is disabled.
 * **Model swaps are the real cost.** Weights live on the microSD (~20–45 MB/s),
-  a cold load costs 40–70 s. The resident set (embedding + 0.6B + 2B VLM + the
-  5 GB MoE ≈ 9 GB) keeps everything a normal turn needs hot; the two cold models
-  live in the `heavy` swap group so they can never push RAM into swap. After a
-  first load, weights stay in page cache, so re-loading costs 1–3 s.
-* **Vision works, but encoding is the cost.** Two VLMs share the heavy group:
-  `assistant` (Qwen3.5-2B, conversational) and `vision-docs` (Qwen3-VL-2B, OCR).
-  On a synthetic invoice `assistant` described it at 6.5 tok/s and `vision-docs`
-  transcribed `FATTURA N. 2026-114 / Totale: 1.284,50 EUR / 15/12/2026` verbatim
-  at 7.9 tok/s. The image encoder (mmproj ViT) is what hurts: 185 image tokens
-  took **48 s at `-t 2` and 30 s at `-t 8`**, so the VLMs alone use eight
-  threads. A repeated image is free (prompt cache); a new one costs ~30 s.
+  a cold load costs 40–110 s (a VLM is 2.2 GB with its projector). The resident
+  set is embedding + MoE + the 0.6B fast tier ≈ 7.5 GB, which covers every text
+  request and leaves ~3.5 GB for one VLM; the VLMs live in the `heavy` swap group
+  so they can never push RAM into swap. After a first load, weights stay in page
+  cache, so re-loading costs 13 s.
+* **Vision works, but the load and the encoder are the cost.** Two VLMs share the
+  heavy group: `assistant` (Qwen3.5-2B, conversational) and `vision-docs`
+  (Qwen3-VL-2B, OCR). Both read a synthetic invoice correctly — `assistant`
+  transcribed `FATTURA N. 2026-114 / Data: 15/12/2026 / Imponibile: 1.036,69 EUR /
+  IVA 22%: 228,07 EUR / Totale: 1.284,50 EUR` line by line, `vision-docs` answered
+  the invoice number just as well — so the split is about the *kind* of question,
+  not about one model being unable to see.
+  Measured end-to-end on the invoice: **8.0 s** warm (same image, prompt cache),
+  **68.8 s** when the VLM had to be loaded, ~100 s when the router also had to
+  swap one VLM for the other. The image encoder (mmproj ViT) is the other half:
+  185 image tokens took **48 s at `-t 2` and 30 s at `-t 8`**, so the VLMs alone
+  use eight threads. The router therefore keeps the two VLMs from flapping:
+  "trascrivi / estrai il testo / fattura / screenshot / tabella" go to
+  `vision-docs`, everything else to `assistant`, and an explicit `model:` id
+  always wins.
 * **The NPU is not usable.** The A733's NPU has no mainline driver, no
   `llama.cpp` backend and no `/dev/galcore`; `ggml` CPU (NEON dotprod + fp16) is
   the only path. `i8mm` and `SVE` are absent, so the build pins
@@ -130,15 +145,17 @@ group model alone could not be trusted to keep the stack fast.
 | group | swap | members | effect |
 | --- | --- | --- | --- |
 | `core` | no, `persistent` | embedding-model, reasoner | always loaded, never evicted (~5.7 GB anon) |
-| `heavy` | yes | router-0.6b, assistant, vision-docs | one at a time, on demand |
+| `heavy` | yes | router-0.6b, assistant, vision-docs | one at a time; all three preloaded except the VLMs |
 
-Why the fast tier and the VLMs are *not* resident: 12 GB sits exactly at the
-limit. With embedding + 0.6B + VLM + MoE loaded the board had 226 MB available
-and the kernel swapped the whole router-0.6b (896 MB) and 2 GB of the MoE's KV
-into zram. Resident = embedding + MoE leaves 3.7 GB available and zero swap;
-the first use of a heavy model costs a few seconds because its weights stay in
-page cache (the MoE is the exception: it copies expert tensors into anonymous
-memory, so it is preloaded and never evicted).
+Why the VLMs are *not* resident: 12 GB sits exactly at the limit. With
+embedding + 0.6B + VLM + MoE loaded the board had 226 MB available and the
+kernel swapped the whole router-0.6b (896 MB) and 2 GB of the MoE's KV into
+zram. Resident = embedding + MoE leaves 3.7 GB available and zero swap.
+
+The fast tier *is* preloaded even though it is evictable, because it answers the
+most frequent requests: the first `ciao` after a reboot spent **141 s** waiting
+for a cold 0.62 GB read from microSD, versus **1.1 s** once preloaded. A vision
+load still evicts it; the warm reload then costs 13 s.
 
 ## Endpoints
 
@@ -157,10 +174,15 @@ was chosen and why (`client`, `sticky`, `image`, `image+ocr-hint`, `chitchat`,
 `assistant`/`reason` → reasoner, `vision` → assistant, `vision-docs` →
 vision-docs, `embedding` → embedding-model.
 
-Two routing guards exist because the 0.6B failed on them in testing: a request
+Three routing guards exist because the 0.6B failed on them in testing: a request
 that *writes* code is never sent to it however short it is (`scrivi una funzione
-python …`, 9 words, produced broken docstring prose), and one that asks what a
-technical term *is* is not either (it answered `MoE = "Model of Explanation"`).
+python …`, 9 words, produced broken docstring prose), one that asks what a
+technical term *is* is not either (it answered `MoE = "Model of Explanation"`),
+and neither is a short *factual* question — `Chi ha scritto la Divina Commedia e
+in che anno è ambientata?` is 11 words and starts with `chi`, so it used to be
+"trivial" and the 0.6B answered *"periodo 1301-1310"*. A question that contains a
+proper noun or a `chi ha scritto` / `in che anno` / `who wrote` shape now goes to
+the MoE.
 Small talk goes the other way — `ciao, come stai?` now lands on the tiny tier in
 1.0 s instead of waking the 5 GB model, with a one-line system prompt that keeps
 it in the user's language (it used to answer Italian with Spanish).
