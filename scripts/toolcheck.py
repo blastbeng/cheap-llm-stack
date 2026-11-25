@@ -131,6 +131,9 @@ def main() -> int:
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=1234, help="0 = let the server sample")
+    ap.add_argument("--budget", type=int, default=None,
+                    help="reasoning_budget_tokens to send (default: the router's)")
+    ap.add_argument("--temperature", type=float, default=0.2)
     args = ap.parse_args()
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
@@ -139,8 +142,10 @@ def main() -> int:
     warned = 0
     for key, prompt, expect, argcheck in cases:
         payload = {"model": args.model, "messages": [{"role": "user", "content": prompt}],
-                   "tools": TOOLS, "tool_choice": "auto", "temperature": 0.2,
-                   "max_tokens": 400}
+                   "tools": TOOLS, "tool_choice": "auto",
+                   "temperature": args.temperature, "max_tokens": 400}
+        if args.budget is not None:
+            payload["reasoning_budget_tokens"] = args.budget
         if args.seed:
             payload["seed"] = args.seed
         if args.stream:
