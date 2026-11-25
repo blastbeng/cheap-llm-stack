@@ -119,8 +119,19 @@ build_llama() {
     local tag="$1"
     log "Building llama.cpp ${tag} (CPU only, A76/A55: armv8.2-a+dotprod+fp16)..."
     run rm -rf "${LLAMA_DIR}"
-    run git clone --depth 1 --branch "${tag}" \
-        https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
+    if [[ "${tag}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        # A commit sha, not a tag: `git clone --branch` cannot name one. The
+        # weekly updater pins a sha (the tip of master it read from ls-remote) so
+        # the build it verifies is the commit it tested, even if master moves
+        # during the 40 minutes it takes to compile here.
+        run git clone --depth 1 \
+            https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
+        run git -C "${LLAMA_DIR}" fetch --depth 1 origin "${tag}"
+        run git -C "${LLAMA_DIR}" checkout --detach FETCH_HEAD
+    else
+        run git clone --depth 1 --branch "${tag}" \
+            https://github.com/ggml-org/llama.cpp.git "${LLAMA_DIR}"
+    fi
     # Out-of-tree build: the clone stays pristine, and no leftover root-owned
     # CMake cache can wedge a later rebuild.
     run rm -rf "${LLAMA_BUILD_DIR}"

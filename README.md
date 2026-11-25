@@ -320,12 +320,23 @@ sudo ./scripts/tune.sh --apply    # swappiness, noatime, governor, zram checks
 ./healthcheck.sh --tools          # + the 7-case tool-calling battery
 ./scripts/toolcheck.py            # tool calling on its own (--quick, --stream, --model)
 ./benchmark.sh --all              # pp/tg per model, embedding latency
-sudo ./update-llama.cpp.sh        # rebuild llama.cpp at the latest tag (timer runs it weekly)
+sudo ./update-llama.cpp.sh        # rebuild llama.cpp at the tip of master (the timer runs it weekly)
+sudo LLAMA_CPP_SOURCE=release ./update-llama.cpp.sh   # newest release tag instead
+sudo LLAMA_CPP_TAG=v1.0.0 ./update-llama.cpp.sh       # one exact ref, bypasses the comparison
 ```
 
 Model downloads are resumable (`curl -C -`); re-running `install.sh` only fetches
 what is missing. llama.cpp is rebuilt every Sunday at 03:00 by
-`llama-swap-update.timer` and the service restarted only when the tag changes.
+`llama-swap-update.timer`, which tracks **the tip of master** and does nothing when
+it has not moved.
+
+**Why master and not releases.** The newest llama.cpp release is v1.0.0
+(2026-11-13), the build this board ships, so a release tracker would compile
+nothing for months and the gate below would never run. The regressions that matter
+here — chat-template handlers, tool parsers, ARM kernels — land on master and are
+fixed there in days. Weekly master behind a gate that rolls back has the risk
+profile of a release and the content of a year, and a broken tip is *skipped*, not
+installed (see step 6).
 
 **The weekly rebuild is why `healthcheck.sh --tools` exists.** Tool calling depends
 on the model's chat template being recognised by a native handler in
@@ -336,16 +347,23 @@ and nobody would know.
 
 So the update script gates the new build on the battery instead of trusting it:
 
-1. before compiling, `bin/` (62 MB) and the version tag are copied to
+1. before compiling, `bin/` (62 MB) and the version id are copied to
    `.build-backup/`, replacing the previous backup;
-2. the build runs through `install.sh` (same flags as a first install);
+2. the build runs through `install.sh` (same flags as a first install). On master
+   the tip sha is pinned, so the binary that is verified is the commit that was
+   read from `ls-remote`, even if master moves during the 40 min compile;
 3. llama-swap is restarted and must answer `/v1/models` within 2 min;
 4. `toolcheck.py --only tg,web,mem,wx,multi,none` runs **through the router** (a
    direct call to `:10001` would skip the reasoning budget and the tool-turn
    temperature floor, i.e. test a configuration no client uses);
 5. on failure the battery is retried once, then `.build-backup/bin` is restored,
    llama-swap is restarted, the battery is run again to prove the rollback, and the
-   unit exits non-zero so `systemctl --failed` shows it.
+   unit exits non-zero so `systemctl --failed` shows it;
+6. the sha that failed (compile failure, no start, or a failed battery) goes to
+   `.llama-cpp-broken`. The next run compares it against the tip: same sha means
+   the build is skipped with a warning and exit 0, so a broken master does not
+   cost 40 min of compile every Sunday. It clears by itself when master moves, and
+   a verified build clears it.
 
 A bad build therefore costs one night's tools, not a week's. `.build-backup/` is
 also the manual rollback:

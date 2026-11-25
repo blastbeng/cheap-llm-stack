@@ -4,6 +4,12 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+# A master rebuild is 20-40 min of ninja -j8 on the same 8 cores that serve the
+# models. Nice only yields CPU under contention, so an idle board compiles at
+# full speed while a board with traffic keeps answering requests: llama-server
+# outranks the compiler instead of fighting it. (Type=oneshot already leaves the
+# start timeout at infinity, so a long build is never killed.)
+Nice=10
 User=root
 Group=root
 WorkingDirectory=/opt/cheap-llm-stack
