@@ -36,19 +36,40 @@ fi
 echo "llama-swap ${SWAP}"
 check "orchestrator /v1/models" "${SWAP}/v1/models"
 
-echo "models"
+# Two lists on purpose. llama-swap knows the real model ids; `auto` exists only in
+# the router's answer, so requiring it against ${SWAP} would fail forever.
+echo "models (llama-swap)"
 curl -fsS --max-time 8 "${SWAP}/v1/models" 2>/dev/null | python3 -c '
 import json, sys
 try:
     ids = [m["id"] for m in json.load(sys.stdin)["data"]]
     for i in ids:
         print("  -", i)
-    missing = [m for m in ("auto", "embedding-model", "router", "reasoner", "vision")
+    missing = [m for m in ("embedding-model", "router", "reasoner", "vision")
                if m not in ids]
     if missing:
         print("  [FAIL] not configured:", ", ".join(missing)); sys.exit(1)
 except Exception as exc:
     print("  [FAIL] cannot list models:", exc); sys.exit(1)
+' || fail=1
+
+echo "models (router, what a client sees)"
+curl -fsS --max-time 8 "${ROUTER}/v1/models" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)["data"]
+    ids = [m["id"] for m in d]
+    print("  -", ", ".join(sorted(ids)))
+    missing = [m for m in ("auto", "embedding-model", "router", "reasoner", "vision")
+               if m not in ids]
+    if missing:
+        print("  [FAIL] router is not advertising:", ", ".join(missing)); sys.exit(1)
+    auto = [m for m in d if m["id"] == "auto"]
+    cap = (auto[0].get("capabilities") or {}) if auto else {}
+    if not cap.get("function_calling") or not cap.get("vision"):
+        print("  [FAIL] auto does not advertise function_calling + vision"); sys.exit(1)
+except Exception as exc:
+    print("  [FAIL] cannot list models through the router:", exc); sys.exit(1)
 ' || fail=1
 
 echo "embedding-model (mandatory, always online)"
