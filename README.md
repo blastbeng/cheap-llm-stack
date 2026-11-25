@@ -315,6 +315,31 @@ starts emitting the call as plain text instead of `tool_calls`. Nothing else in 
 stack notices — `/health` is fine, chat is fine — so the battery would go 7/7 → 3/7
 and nobody would know.
 
+So the update script gates the new build on the battery instead of trusting it:
+
+1. before compiling, `bin/` (62 MB) and the version tag are copied to
+   `.build-backup/`, replacing the previous backup;
+2. the build runs through `install.sh` (same flags as a first install);
+3. llama-swap is restarted and must answer `/v1/models` within 2 min;
+4. `toolcheck.py --only tg,web,mem,wx,multi,none` runs **through the router** (a
+   direct call to `:10001` would skip the reasoning budget and the tool-turn
+   temperature floor, i.e. test a configuration no client uses);
+5. on failure the battery is retried once, then `.build-backup/bin` is restored,
+   llama-swap is restarted, the battery is run again to prove the rollback, and the
+   unit exits non-zero so `systemctl --failed` shows it.
+
+A bad build therefore costs one night's tools, not a week's. `.build-backup/` is
+also the manual rollback:
+
+```bash
+sudo rm -rf /opt/cheap-llm-stack/bin && sudo cp -a /opt/cheap-llm-stack/.build-backup/bin /opt/cheap-llm-stack/bin
+sudo cp /opt/cheap-llm-stack/.build-backup/version /opt/cheap-llm-stack/.llama-cpp-version
+sudo systemctl restart llama-swap && ./healthcheck.sh --tools
+```
+
+If the rollback also fails the battery, the script says so explicitly: the build is
+not the cause (look at the model files, the config, or the router).
+
 ## Layout
 
 ```

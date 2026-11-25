@@ -9,6 +9,9 @@
 /bin/
 /models/
 /.llama-cpp-version
+# rolling copy of the last build that passed the tool-calling check, kept by
+# update-llama.cpp.sh so a regression can be rolled back without a 40 min rebuild
+/.build-backup/
 *.log
 
 # python bytecode
