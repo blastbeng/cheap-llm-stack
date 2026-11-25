@@ -13,8 +13,8 @@ client ──► :10000  llm-router          content-aware orchestrator (Python,
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
               ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
               ├── reasoner              LFM2.5-8B-A1B  MoE Q4_0  12k   CORE, text + TOOLS
-              ├── router                Qwen3-0.6B            Q8_0   4k   CORE, chitchat only
-              └── vision                LFM3-VL-2B  QAD-Q4_0       4k   heavy, images / OCR
+              ├── router                Qwen3-0.6B            Q8_0   6k   CORE, chitchat only
+              └── vision                LFM3-VL-2B  QAD-Q4_0       6k   heavy, images / OCR
 ```
 
 Four models, one job each. Anything that needs to think, write or call a tool goes
@@ -169,6 +169,7 @@ in it goes to the VLM; embeddings are always on.
 | KV cache | **q8_0** (`--flash-attn on`) | half the KV footprint, negligible quality loss |
 | chat ctx | **12288** | +20 MB anon and no decode loss vs 8192 (measured); 8k prefill already costs ~5 min at 25 tok/s, so more would only buy room nobody waits for |
 | embedding ctx | **4096** | mandatory model, always resident: keep its KV small |
+| tiny / VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation (and a VLM also pays ~1k tokens for one image); the 2k extra are cheap in RAM and only the first turn pays that prefill, later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
 | `--reasoning-budget` | **32** | measured sweet spot: clean `content`, 7/7 tool calling, 17.9 s/call |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 4.9 GB MoE stays reclaimable |
@@ -177,17 +178,22 @@ in it goes to the VLM; embeddings are always on.
 
 `VmRSS` + `VmSwap` per llama-server with `--parallel 1`:
 
-| model | weights (file) | anon (KV + buffers) | ctx |
+| model | weights (file) | `Anonymous` (KV + buffers) | ctx |
 | --- | --- | --- | --- |
-| Qwen3-Embedding-0.6B | 0.62 GB | 0.5 GB | 4096 |
-| Qwen3-0.6B | 0.62 GB | 0.6 GB | 4096 |
-| LFM2.5-8B-A1B | 4.85 GB (mmap) | **4.62 GB** | 12288 |
-| LFM3-VL-2B + mmproj | 1.05 + 0.20 GB | ~1.0 GB | 4096 |
+| Qwen3-Embedding-0.6B | 0.62 GB | 0.70 GB | 4096 |
+| Qwen3-0.6B | 0.62 GB | 1.00 GB | 6144 |
+| LFM2.5-8B-A1B | 4.85 GB (mmap) | **4.65 GB** | 12288 |
+| LFM3-VL-2B + mmproj | 1.05 + 0.20 GB | 1.28 GB | 6144 |
+
+`Anonymous` from `smaps_rollup` with all four loaded: 7.6 GB, `free` reports
+9.5 GB used and 2.4 GB available, no OOM, 64 °C. The ctx bump costs 59 KB/token on
+the 0.6B — measured 905 MB at 4096 vs 1025 MB at 6144, which is exactly the q8_0 KV
+size, so it is the only part that scales.
 
 At 16k with four resident models the board needed ~12.5 GB and went into zram swap
 (5.7 GB swapped, 400 MB available) — the MoE then took 5 minutes to answer its
-health check. At the sizes above it fits in ~6.5 GB and leaves several GB of page
-cache for the cold VLM.
+health check. At the sizes above it fits with GBs of page cache to spare for the
+cold VLM.
 
 ## Groups
 
@@ -258,6 +264,15 @@ Tool turns are decided **before** everything else, including stickiness:
 * the session's sticky entry is re-pinned to `tools`, so a conversation that
   started as `ciao` cannot stay on the 0.6B once a tool appears.
 
+An explicit model id is normally forwarded verbatim — that is how you debug one
+tier. The one exception is the tiny tier: a request addressed to `router-0.6b`,
+`fast` or `tiny` that carries `tools` (or a tool history) is answered by the
+`tools` route instead, and reports `X-Route-By: tools-on-tiny`. Tool orchestration
+lives on the MoE; the 0.6B *does* emit a call 7/7 but mangles the arguments, and
+its 6k context cannot hold a real schema block plus a conversation. `router` needs
+no guard — it is a routing alias already, so `tools` wins before the model is
+picked.
+
 The tool payload is passed through verbatim (`tools`, `tool_choice`,
 `parallel_tool_calls`), no system prompt is injected (it would shift the cached
 prefix), the thinking budget is set to 32, the answer ceiling is raised to at least
@@ -322,12 +337,16 @@ of them bit us:
 * **Native function calling is expensive here and it is ON by default.** With
   the builtin tool categories untouched, a plain `hello` carried 28 schemas and
   **5,430 prompt tokens**; adding one MCP server made it 31 schemas and **7,640
-  tokens** — 95 % of the prompt. On a 4096-token model that is a guaranteed
-  `413 prompt_too_large`, on the 12,288-token MoE it leaves room for one turn.
+  tokens** — 95 % of the prompt. On the tiny tier (4k then, 6k now) that is a
+  guaranteed `413 prompt_too_large`, on the 12,288-token MoE it leaves room for
+  one turn.
   The context limit is not the problem; the schemas are.
-* **Raising `--ctx-size` is the wrong fix.** Measured prefill on this board is
-  21–35 tok/s, so a 7.6k prompt costs 4–6 minutes *per request*. Only shrinking
-  the prompt scales.
+* **Raising `--ctx-size` does not fix schemas.** Measured prefill on this board is
+  21–35 tok/s, so a 7.6k prompt costs 4–6 minutes *per request*. More context only
+  buys room for the schemas to fill. It was still worth going 4096 → 6144 on the
+  tiny/VLM tiers (see Measured settings), because once the surface is down to two
+  tools the *fixed* part of the prompt is ~1k and the cache makes later turns
+  nearly free — the extra room then goes to the conversation, which is the point.
 
 So, for every model that shadows a connection id (Workspace → Models, or
 `POST /api/v1/models/create` with `base_model_id: null` and the connection id as
@@ -344,18 +363,24 @@ So, for every model that shadows a connection id (Workspace → Models, or
 3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 2 meta-tools, ~640
    tokens, and the whole 126-tool gateway behind one search call. In Open WebUI
    a global `inlet` filter injects that id into every chat, so `TOOL_IDS` there
-   must equal the connection's `info.id`.
+   must equal the connection's `info.id`. That filter is also where the
+   orchestration is consolidated: it *strips* every tool id for `cheap/router`
+   (the tiny tier never gets one, not even when picked by hand) and only
+   auto-injects on `cheap/auto`, `cheap/reasoner` and the non-cheap models;
+   `cheap/vision` can still opt in manually for the image+tools turn.
 4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
-   over the prompt, and compaction cannot fit a 4k model anyway.
+   over the prompt, and compaction cannot fit a 6k model anyway.
 
-Measured on `cheap/router` (4096) with this profile: **990 prompt tokens**,
-15.7 s first-turn prefill and **0.3 s on the following turn** — with a constant
-2-tool surface the chat prefix stays byte-identical, llama.cpp reuses its cache
-and only the new message is prefilled. That cache hit is the real payoff of a
-small tool surface, more than the tokens themselves. `cheap/auto` answers the
-same shape of request in 990 tokens and routes through the orchestrator
-(`auto` is the magic id; `reasoner`/`router` bypass routing, which is only
-useful for debugging).
+Measured with this profile: `cheap/router` carries **50 prompt tokens** and no
+tools at all, `cheap/reasoner` carries **819** with the two meta-tools, 15.7 s
+first-turn prefill and **0.3 s on the following turn** — with a constant 2-tool
+surface the chat prefix stays byte-identical, llama.cpp reuses its cache and only
+the new message is prefilled. That cache hit is the real payoff of a small tool
+surface, more than the tokens themselves. `cheap/auto` answers the same shape of
+request in 990 tokens and routes through the orchestrator. `auto`, `router` and
+`orchestrator` are the magic ids that mean "route this" — `router` included, it
+does not pin the 0.6B; `reasoner` and `vision` are the direct ids, useful for
+debugging only.
 
 Reasoning shows up as `reasoning_content`; Open WebUI renders it as the thinking
 block. At budget 32 it is short by design.
