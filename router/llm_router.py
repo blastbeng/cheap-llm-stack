@@ -77,6 +77,13 @@ UPSTREAM_PORT = int(os.environ.get("LLAMA_SWAP_PORT", "10001"))
 LISTEN_HOST = os.environ.get("ROUTER_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("ROUTER_PORT", "10000"))
 
+# ROUTER_DEBUG_BODY=1 logs the exact JSON handed upstream. It exists for one job:
+# a tool-call case that passes straight at the MoE and fails through this proxy is
+# only explainable by what the proxy changed in the payload, and guessing that is a
+# waste of an afternoon at 20 s per case. Off by default — a request body carries
+# user text.
+DEBUG_BODY = os.environ.get("ROUTER_DEBUG_BODY", "0") == "1"
+
 STICKY_TTL = int(os.environ.get("ROUTER_STICKY_TTL", "1800"))
 SEM_THRESHOLD = float(os.environ.get("ROUTER_SEM_THRESHOLD", "0.45"))
 SEM_MIN_MARGIN = float(os.environ.get("ROUTER_SEM_MARGIN", "0.02"))
@@ -664,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
             log("route=%s model=%s by=%s budget=%s max_tokens=%s %.0fms"
                 % (route, model, why, body.get("reasoning_budget_tokens"),
                    body.get("max_tokens") or body.get("max_completion_tokens"), elapsed))
+            if DEBUG_BODY:
+                log("forwarded: %s" % json.dumps(body, ensure_ascii=False)[:2000])
             return self._forward(json.dumps(body).encode(), path, model, route, why, elapsed,
                                  body.get("reasoning_budget_tokens"))
 

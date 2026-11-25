@@ -22,6 +22,10 @@ Usage:
   scripts/toolcheck.py --quick               # 3 cases (~1 min)
   scripts/toolcheck.py --stream              # same battery over SSE
   scripts/toolcheck.py --seed 0              # unseeded sampling (what users get)
+  scripts/toolcheck.py --only tg,none         # the two cases that ever flip
+  scripts/toolcheck.py --url http://127.0.0.1:10001 --model reasoner --budget 32
+                                              # the same case straight at the MoE: the way
+                                              # to tell a router bug from a sampling draw
 
 Sampling is seeded by default: the MoE is a 1.5B-active model at temperature 0.2 and
 one case of seven flips between runs (the Telegram case did, once, in production),
@@ -128,6 +132,8 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:10000")
     ap.add_argument("--model", default="auto")
     ap.add_argument("--quick", action="store_true", help="only the three decisive cases")
+    ap.add_argument("--only", metavar="KEYS",
+                    help="comma-separated case ids to run (tg, web, mem, vec, wx, multi, none)")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=1234, help="0 = let the server sample")
@@ -138,6 +144,14 @@ def main() -> int:
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
     cases = [c for c in CASES if not args.quick or c[0] in QUICK]
+    if args.only:
+        wanted = {k.strip() for k in args.only.split(",") if k.strip()}
+        unknown = wanted - {c[0] for c in CASES}
+        if unknown:
+            print("unknown case id(s): %s — valid: %s"
+                  % (", ".join(sorted(unknown)), ", ".join(c[0] for c in CASES)))
+            return 2
+        cases = [c for c in CASES if c[0] in wanted]
     ok = 0
     warned = 0
     for key, prompt, expect, argcheck in cases:
