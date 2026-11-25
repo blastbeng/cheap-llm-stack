@@ -216,11 +216,14 @@ false alarm in the only monitor this board has is worse than the silence it
 replaces. Turning the UI on to satisfy the probe would add a Hugging Face bundle
 download to every weekly rebuild. `router/llm_router.py: warm_loop` does the job
 properly instead: one 1-token request per core model through llama-swap, at boot
-**and every time llama-swap comes back from being down** — the case the hook
+**and every time the llama-swap process is replaced** — the case the hook
 cannot cover, because the weekly rebuild restarts llama-swap and the first tool
 case of the update gate then measured the MoE load (**93 s**) rather than the
 build (**17 s**). A 1-token completion also warms the prompt cache, which `GET /`
-never touches.
+never touches. The restart is detected by reading the pid and start time of the
+llama-swap process out of `/proc`, not by polling `/health`: a `systemctl restart`
+is over in 1-2 s, so a 20 s liveness poll misses the window and warms nothing —
+the first version of this loop did exactly that, silently.
 
 `reasoner` has `ttl: 0` and no eviction: a cold load is ~100 s, and an unload also
 throws away the prompt cache that makes agent traffic affordable. (An earlier

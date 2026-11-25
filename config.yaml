@@ -94,9 +94,9 @@ routing:
 # Hugging Face download to every weekly rebuild.
 #
 # Warming is done by the router instead (router/llm_router.py, warm_loop): a
-# 1-token request per core model through llama-swap, at boot and every time
-# llama-swap comes back from being down. The preload hook cannot do that second
-# part, and the weekly rebuild restarts llama-swap.
+# 1-token request per core model through llama-swap, at boot and every time the
+# llama-swap process is replaced. The preload hook cannot do that second part, and
+# the weekly rebuild restarts llama-swap.
 
 models:
 

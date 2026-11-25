@@ -343,6 +343,8 @@ def cosine(a: list[float], b: list[float]) -> float:
 #     prompt cache and the KV slots, which is what makes a tools+system prefix
 #     cost 4-6 s warm instead of 43 s cold.
 WARM_ENABLED = os.environ.get("ROUTER_WARM", "1") == "1"
+# The interval only bounds how long after a llama-swap restart the warm-up starts;
+# between restarts the loop costs one /proc scan and one HTTP GET.
 WARM_POLL_SEC = int(os.environ.get("ROUTER_WARM_POLL", "20"))
 # Order matters: the embedding model is what Prototypes.build is waiting for, and
 # the MoE is the slow load, so it goes last and never blocks the front door.
@@ -376,21 +378,54 @@ def warm_model(model: str) -> bool:
         return False
 
 
+def llama_swap_identity() -> tuple[int, int] | None:
+    """(pid, start time) of the running llama-swap, or None when it is not running.
+
+    /proc/<pid>/stat field 22 is the process start time in clock ticks since boot,
+    so the pair changes whenever the service is replaced. The identity is *read*
+    from /proc rather than polled over HTTP because a `systemctl restart` is over
+    in 1-2 s: a liveness poll every 20 s misses the down window entirely and the
+    warm-up silently never runs (measured — the first version of this loop watched
+    /health and logged nothing across a real restart). Scanning /proc also avoids
+    a `systemctl show` subprocess and any dependency on the unit name.
+    """
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/comm" % entry) as fh:
+                if fh.read().strip() != "llama-swap":
+                    continue
+            with open("/proc/%s/stat" % entry) as fh:
+                # "pid (comm) state ppid ..." — the comm field can contain spaces
+                # and parentheses, so split on the last ") ".
+                tail = fh.read().rsplit(") ", 1)[1].split()
+            return int(entry), int(tail[19])      # field 22 == starttime
+        except (FileNotFoundError, PermissionError, ProcessLookupError,
+                IndexError, ValueError, OSError):
+            continue
+    return None
+
+
 def warm_loop() -> None:
-    """Warm the resident set at boot and again every time llama-swap comes back
-    from being down — a restart evicts every model, and that is the case a
-    preload hook cannot cover."""
-    pending = True
-    warmed = False
+    """Warm the resident set at boot and again every time the llama-swap process
+    is replaced — a restart evicts every model, and that is the case a preload
+    hook cannot cover: the weekly rebuild restarts llama-swap, and the update
+    gate's first tool case measured the MoE load (93 s) instead of the build
+    (17 s)."""
+    seen = None
     while True:
-        if not upstream_ok(timeout=3.0):
-            pending = True
-        elif pending:
-            pending = False
-            log("warming the resident set (%s)" % ("boot" if not warmed else "llama-swap restarted"))
-            for model in WARM_MODELS:
-                warm_model(model)
-            warmed = True
+        ident = llama_swap_identity()
+        if ident is None:
+            seen = None                    # llama-swap is gone; warm when it is back
+        elif ident != seen:
+            if upstream_ok(timeout=3.0):
+                log("warming the resident set (%s)"
+                    % ("boot" if seen is None else "llama-swap pid %d" % ident[0]))
+                seen = ident
+                for model in WARM_MODELS:
+                    warm_model(model)
+            # not answering yet: leave `seen` alone and try again next poll
         time.sleep(WARM_POLL_SEC)
 
 
