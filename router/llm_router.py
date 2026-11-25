@@ -189,6 +189,25 @@ TECH_RE = re.compile(
     r"|regex|sql|git|python|rust|golang|javascript|typescript|kernel|filesystem)\b",
     re.IGNORECASE,
 )
+# Questions that need stored world knowledge, not a one-liner. "Chi ha scritto la
+# Divina Commedia e in che anno è ambientata?" is 11 words and starts with "chi",
+# so it matched the trivial rule and the 0.6B answered "periodo 1301-1310".
+FACTUAL_RE = re.compile(
+    r"\b(chi ha (scritto|detto|fatto|inventato|creato|dipinto|composto)"
+    r"|in che (anno|secolo|periodo|epoca)"
+    r"|quando (è|e) (uscito|nato|morto|ambientat|avvenut)"
+    r"|dove (è|e) (nato|ambientat|situat)"
+    r"|who (wrote|invented|discovered|painted|composed)"
+    r"|when was .{0,40}(born|released|published))",
+    re.IGNORECASE,
+)
+# A capitalised word that is not the first token is a name, a place or a title: the
+# request is about an entity, so the tier that has room for facts answers it.
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def has_proper_noun(text: str) -> bool:
+    return any(w[0].isupper() and len(w) > 2 for w in WORD_RE.findall(text)[1:])
 
 
 def log(msg: str) -> None:
@@ -420,6 +439,9 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
         and SHORT_HINT_RE.search(low)
         and not EXPLAIN_RE.search(text)
         and not TECH_RE.search(text)
+        # facts and named entities are not trivia: the 0.6B gets them wrong
+        and not FACTUAL_RE.search(text)
+        and not has_proper_noun(text)
     ):
         return "fast", "trivial"
 

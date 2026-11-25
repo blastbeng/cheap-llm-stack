@@ -156,7 +156,9 @@ fi
 # ---------------------------------------------------------------------------
 # 3. llama-swap (aarch64 static-ish binary)
 # ---------------------------------------------------------------------------
-if [ ! -x "${BIN_DIR}/llama-swap" ] || [ "$("${BIN_DIR}/llama-swap" --version 2>/dev/null | grep -oE 'v?[0-9]+' | head -1)" != "${LLAMA_SWAP_VERSION#v}" ]; then
+# llama-swap prints "version: v275 (e0274d5), ...": match the bare number so a
+# re-install does not re-download 43 MB every time.
+if [ ! -x "${BIN_DIR}/llama-swap" ] || [ "$("${BIN_DIR}/llama-swap" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)" != "${LLAMA_SWAP_VERSION#v}" ]; then
     log "Installing llama-swap ${LLAMA_SWAP_VERSION} (aarch64)..."
     tmp="$(mktemp -d)"
     url="https://github.com/mostlygeek/llama-swap/releases/download/${LLAMA_SWAP_VERSION}/llama-swap_${LLAMA_SWAP_VERSION#v}_linux_arm64.tar.gz"

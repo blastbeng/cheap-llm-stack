@@ -76,12 +76,16 @@ routing:
 
 hooks:
   on_startup:
-    # Only what must never be cold: the mandatory embedding model and the MoE
-    # workhorse. The fast tier and the two VLMs load on first use (their weights
-    # stay in page cache, so that costs seconds, not a 100 s microSD read).
+    # Only what must never be cold: the mandatory embedding model, the MoE
+    # workhorse, and the fast tier. The fast tier is not persistent (a vision
+    # load evicts it), but preloading it means a cold 0.62 GB microSD read never
+    # lands on a user request: measured, the first "ciao" after a reboot spent
+    # 141 s waiting for the 0.6B to load, versus 13 s once its weights are in
+    # page cache. After an eviction the same warm reload applies.
     preload:
       - embedding-model
       - reasoner
+      - router-0.6b
 
 models:
 
@@ -108,10 +112,11 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model for one-line answers: 16.8 tok/s vs 10.7 for the MoE, i.e. ~2 s saved
-  # on a 60-token reply. That is not worth 1.5 GB of permanent RAM on a 12 GB board,
-  # so it is a heavy-group member: loaded on the first trivial request and kept
-  # (ttl 0) until a vision request swaps it out.
+  # Tiny model for one-line answers: 16.8 tok/s vs 11.7 for the MoE, i.e. ~2 s saved
+  # on a 60-token reply. Not worth 1.5 GB of permanent RAM on a 12 GB board, so it
+  # stays a heavy-group member, but it *is* preloaded: it answers the most frequent
+  # requests (greetings, one-liners), and paying its cold load on the first such
+  # request cost 141 s. ttl 0 keeps it until a vision request swaps it out.
   router-0.6b:
     name: "Qwen3-0.6B · fast tier · 16.8 tok/s"
     cmd: >
@@ -140,6 +145,9 @@ models:
   # heavy group because its vision buffers alone are 2 GB of anonymous memory, and
   # 2 GB of VLM + 5 GB of MoE + the two 0.6B models does not fit in 12 GB (measured:
   # 390 MB left, 5.4 GB forced into zram). First picture after a reboot pays a load.
+  # Context is 4096 rather than 8192: a single image is a few hundred tokens and the
+  # VLM's KV is the most expensive allocation here, so 4096 holds a full-page image
+  # plus a long instruction at half the anonymous cost.
   assistant:
     name: "Qwen3.5-2B · text+vision · on demand"
     cmd: >
@@ -148,7 +156,7 @@ models:
       --mmproj ${models_dir}/mmproj-Qwen3.5-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
       ${vis_args}
-      --ctx-size 8192 ${kv_args}
+      --ctx-size 4096 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias assistant
@@ -172,7 +180,7 @@ models:
   # copy of its expert tensors in anonymous memory, so mmap does not make it cheap
   # to reload. That is why it is preloaded and persistent: a cold load is ~100 s.
   reasoner:
-    name: "LFM2-8B-A1B (MoE) · text workhorse · 10.7 tok/s"
+    name: "LFM2-8B-A1B (MoE) · text workhorse · 11.7 tok/s"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/LFM2-8B-A1B-Q4_0.gguf
@@ -213,7 +221,7 @@ models:
       --mmproj ${models_dir}/mmproj-Qwen3-VL-2B-F16.gguf
       --host 127.0.0.1 --port ${PORT}
       ${vis_args}
-      --ctx-size 8192 ${kv_args}
+      --ctx-size 4096 ${kv_args}
       ${gen_args}
       --reasoning off
       --alias vision-docs
