@@ -189,13 +189,15 @@ PROTOTYPES = {
 }
 
 # ---------------------------------------------------------------- rule hints ---
+# An actual snippet or crash in the message, not the *name* of a technology. The
+# difference matters: "riassumi in 5 punti i vantaggi di Rust rispetto a Go" is 10
+# words and used to hit this rule through the word "rust", land on the 0.6B and come
+# back with three shallow lines. Technology vocabulary lives in TECH_RE and now only
+# guards the tiny tier; a shortcut to it needs code you can point at.
 CODE_RE = re.compile(
     r"```|~~|\bdef\s+\w+\s*\(|\bclass\s+\w+|\bfunction\s+\w+\(|\bimport\s+\w+|#include"
     r"|\bTraceback \(most recent call last\)|\b\w+Error:|\bsegfault\b|\bnull pointer\b"
-    r"|\bSELECT\b.+\bFROM\b|\bCREATE TABLE\b|\bgit\s+(commit|rebase|merge|cherry-pick)\b"
-    r"|\bdocker(-compose)?\s+(run|build|up)\b|\bkubernetes\b|\bregex\b|\bunit test\b"
-    r"|\bAPI endpoint\b|\bpython\b|\brust\b|\bgolang\b|\btypescript\b|\bjavascript\b"
-    r"|\bSQL\b|\bcmake\b|\bmakefile\b|\bsystemd\b",
+    r"|\bSELECT\b.+?\bFROM\b|\bCREATE TABLE\b",
     re.IGNORECASE,
 )
 REASON_RE = re.compile(
