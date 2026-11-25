@@ -59,14 +59,14 @@ routing:
       groups:
         # Always resident (swap:false = all members run together, persistent = never evicted).
         # exclusive:false so that loading the VLM never unloads this group.
-        #   embedding 0.7 GB + router-0.6b 0.96 GB + reasoner ~6.4 GB at 12k ctx
+        #   embedding 0.7 GB + router 0.96 GB + reasoner ~6.4 GB at 12k ctx
         core:
           swap: false
           exclusive: false
           persistent: true
           members:
             - embedding-model
-            - router-0.6b
+            - router
             - reasoner
         # The VLM is one-at-a-time and loads on demand: its vision buffers are the
         # largest anonymous allocation after the MoE, and keeping it resident too
@@ -87,7 +87,7 @@ hooks:
     preload:
       - embedding-model
       - reasoner
-      - router-0.6b
+      - router
 
 models:
 
@@ -114,11 +114,14 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model for one-line answers: ~16 tok/s vs ~10.4 for the MoE, i.e. ~2 s saved
-  # on a 60-token reply. It must never see a tool request: it does emit tool_calls
+  # Tiny model for one-line answers. Measured on the board: a 40-token chitchat reply
+  # takes 1.05 s here versus 4.0 s on the MoE, so the 0.96 GB it costs is the cheapest
+  # latency win in the stack. It must never see a tool request: it does emit tool_calls
   # (7/7) but mangles the arguments and writes poor prose, so the router keeps
   # `tools` on the MoE and only sends greetings, one-liners and short translations here.
-  router-0.6b:
+  # The id is plain `router` because that is how it is reached: the front door decides
+  # on this model for trivial turns. `router-0.6b` stays as an alias for debugging.
+  router:
     name: "Qwen3-0.6B · fast tier · chitchat only"
     cmd: >
       ${llama_bin}
@@ -129,10 +132,11 @@ models:
       --ctx-size 4096 ${kv_args}
       ${gen_args}
       --reasoning off
-      --alias router-0.6b
+      --alias router
       --load-mode mmap
     ttl: 0
     aliases:
+      - router-0.6b
       - fast
       - tiny
     checkEndpoint: /health

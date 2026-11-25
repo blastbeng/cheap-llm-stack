@@ -13,7 +13,7 @@ client ──► :10000  llm-router          content-aware orchestrator (Python,
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
               ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
               ├── reasoner              LFM2.5-8B-A1B  MoE Q4_0  12k   CORE, text + TOOLS
-              ├── router-0.6b           Qwen3-0.6B            Q8_0   4k   CORE, chitchat only
+              ├── router                Qwen3-0.6B            Q8_0   4k   CORE, chitchat only
               └── vision                LFM3-VL-2B  QAD-Q4_0       4k   heavy, images / OCR
 ```
 
@@ -167,11 +167,11 @@ cache for the cold VLM.
 
 | group | swap | members | effect |
 | --- | --- | --- | --- |
-| `core` | no, `persistent` | embedding-model, router-0.6b, reasoner | always loaded, never evicted (~6.5 GB anon) |
+| `core` | no, `persistent` | embedding-model, router, reasoner | always loaded, never evicted (~6.5 GB anon) |
 | `heavy` | yes | vision | loads on demand, `ttl: 900` |
 
 The VLM is *not* resident: with embedding + 0.6B + VLM + MoE loaded the board once
-had 226 MB available and the kernel swapped the whole router-0.6b (896 MB) and
+had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
 2 GB of the MoE's KV into zram.
 
 The fast tier *is* preloaded even though it is evictable, because it answers the
@@ -197,7 +197,7 @@ Response headers `X-Route`, `X-Route-Model`, `X-Route-By`, `X-Route-Ms`,
 `image`, `image+ocr-hint`, `chitchat`, `code`, `reasoning`, `trivial`,
 `translate-short`, `semantic(0.71/0.09)`, `semantic-fast-rejected`, `default`).
 
-Routes: `fast` → router-0.6b, `assistant`/`reason`/**`tools`** → reasoner,
+Routes: `fast` → router, `assistant`/`reason`/**`tools`** → reasoner,
 `vision`/`vision-docs` → vision, `embedding` → embedding-model.
 
 ### Tool-calling routing
@@ -250,7 +250,10 @@ normalise/repair in the MCP gateway) — a bigger model does not fix it.
 1. Settings → Connections → OpenAI: base URL `http://<board>:10000/v1`,
    API key anything (no key is set), provider hint `llama.cpp`.
 2. Pick the model **`auto`** — it is the orchestrator. Choosing `reasoner` or
-   `router-0.6b` directly bypasses routing (useful for debugging, not for use).
+   `router` directly bypasses routing (useful for debugging, not for use).
+   `auto`, `router` and `orchestrator` are the three magic ids that mean "route
+   this"; for direct access to a model use its own id (`embedding-model`,
+   `reasoner`, `vision`) or the `router-0.6b` alias of the tiny tier.
 3. Enable native function calling on the model (Open WebUI exposes it per model
    under Advanced Params); `/v1/models` advertises
    `capabilities.function_calling: true`.

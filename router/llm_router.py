@@ -49,8 +49,11 @@ bounce between models.
 Response headers: X-Route, X-Route-Model, X-Route-By, X-Route-Ms, X-Route-Budget.
 
 The router also advertises a synthetic model id, `auto`, in GET /v1/models. Without
-it a client can only pick a raw llama-swap id (assistant, reasoner, ...), which is
-passed through verbatim and therefore *bypasses* every decision above.
+it a client can only pick a raw llama-swap id (router, reasoner, vision,
+embedding-model), which is passed through verbatim and therefore *bypasses* every
+decision above. `auto`, `router` and `orchestrator` are the three magic ids that
+mean "route this request"; the tiny tier keeps the `router-0.6b` alias so it can
+still be addressed directly when debugging.
 """
 
 from __future__ import annotations
@@ -105,7 +108,7 @@ DEFAULT_ROUTE = "assistant"
 # the board *and* the fastest of the big ones, so there is nothing to split between a
 # small default, a quality escalation and an agent tier for text.
 ROUTE_MODEL = {
-    "fast": "router-0.6b",
+    "fast": "router",
     "assistant": "reasoner",
     "reason": "reasoner",
     "tools": "reasoner",

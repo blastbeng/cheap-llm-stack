@@ -43,7 +43,7 @@ try:
     ids = [m["id"] for m in json.load(sys.stdin)["data"]]
     for i in ids:
         print("  -", i)
-    missing = [m for m in ("auto", "embedding-model", "router-0.6b", "reasoner", "vision")
+    missing = [m for m in ("auto", "embedding-model", "router", "reasoner", "vision")
                if m not in ids]
     if missing:
         print("  [FAIL] not configured:", ", ".join(missing)); sys.exit(1)

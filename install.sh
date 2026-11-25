@@ -195,7 +195,7 @@ fetch() { # repo remote_file local_file
 # Four models, nothing else. The list is also the prune whitelist (--prune-models).
 REQUIRED_MODELS=(
     "Qwen3-Embedding-0.6B-Q8_0.gguf"       # embedding-model    (mandatory, always on)
-    "Qwen3-0.6B-Q8_0.gguf"                 # router-0.6b        (chitchat / trivial)
+    "Qwen3-0.6B-Q8_0.gguf"                 # router             (chitchat / trivial)
     "LFM2.5-8B-A1B-Q4_0.gguf"              # reasoner           (default + tool calling)
     "LFM3-VL-2B-QAD-Q4_0.gguf"             # vision             (images / OCR)
     "mmproj-LFM3-VL-2B-Q8_0.gguf"          # vision projector
