@@ -200,9 +200,27 @@ The VLM is *not* resident: with embedding + 0.6B + VLM + MoE loaded the board on
 had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
 2 GB of the MoE's KV into zram.
 
-The fast tier *is* preloaded even though it is evictable, because it answers the
+The fast tier *is* kept warm even though it is evictable, because it answers the
 most frequent requests: the first `ciao` after a reboot spent **141 s** waiting
-for a cold 0.62 GB read from microSD, versus **1.1 s** once preloaded.
+for a cold 0.62 GB read from microSD, versus **1.1 s** with the weights in page
+cache.
+
+**Warming is done by the router, not by llama-swap's `hooks.on_startup.preload`,
+and that hook is deliberately absent from `config.yaml`.** The hook is a synthetic
+`GET /` routed to the model, and the status of that GET is what llama-swap reports
+as success (upstream `internal/server/api.go`, `startPreload`). llama.cpp built
+with `-DLLAMA_USE_PREBUILT_UI=OFF` registers no `/` route, so every start logged
+`[ERROR] failed to preload model <id>: status 404` while the model loaded and
+passed its health check — reproduced against a stub upstream, and a permanent
+false alarm in the only monitor this board has is worse than the silence it
+replaces. Turning the UI on to satisfy the probe would add a Hugging Face bundle
+download to every weekly rebuild. `router/llm_router.py: warm_loop` does the job
+properly instead: one 1-token request per core model through llama-swap, at boot
+**and every time llama-swap comes back from being down** — the case the hook
+cannot cover, because the weekly rebuild restarts llama-swap and the first tool
+case of the update gate then measured the MoE load (**93 s**) rather than the
+build (**17 s**). A 1-token completion also warms the prompt cache, which `GET /`
+never touches.
 
 `reasoner` has `ttl: 0` and no eviction: a cold load is ~100 s, and an unload also
 throws away the prompt cache that makes agent traffic affordable. (An earlier
@@ -352,7 +370,9 @@ So the update script gates the new build on the battery instead of trusting it:
 2. the build runs through `install.sh` (same flags as a first install). On master
    the tip sha is pinned, so the binary that is verified is the commit that was
    read from `ls-remote`, even if master moves during the 40 min compile;
-3. llama-swap is restarted and must answer `/v1/models` within 2 min;
+3. llama-swap is restarted and must answer `/v1/models` within 2 min; the workhorse
+   is warmed with a 1-token request so the battery measures the build, not a cold
+   model load (the router's warm loop does the same for the whole resident set);
 4. `toolcheck.py --only tg,web,mem,wx,multi,none` runs **through the router** (a
    direct call to `:10001` would skip the reasoning budget and the tool-turn
    temperature floor, i.e. test a configuration no client uses);

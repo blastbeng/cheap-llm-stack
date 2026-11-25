@@ -78,16 +78,25 @@ routing:
           members:
             - vision
 
-hooks:
-  on_startup:
-    # Only what must never be cold: the mandatory embedding model, the MoE
-    # workhorse (default + tool calling) and the fast tier. Preloading the fast
-    # tier matters: measured, the first "ciao" after a reboot spent 141 s waiting
-    # for the 0.6B to load instead of 13 s once its weights were in page cache.
-    preload:
-      - embedding-model
-      - reasoner
-      - router
+# No `hooks.on_startup.preload` here, on purpose.
+#
+# The three core models must never be cold: measured, the first "ciao" after a
+# reboot spent 141 s waiting for the 0.6B to load instead of 13 s with its weights
+# in page cache. But llama-swap's preload is the wrong tool for it. It is
+# implemented as a synthetic `GET /` routed to the model, and the status of that
+# GET is what it reports as success (upstream internal/server/api.go:
+# startPreload). Our llama.cpp is built with -DLLAMA_USE_PREBUILT_UI=OFF and has
+# no `/` route, so every startup logged
+#     [ERROR] failed to preload model <id>: status 404
+# with the model loaded and healthy — a permanent false alarm in the only monitor
+# this board has. Reproduced against a stub upstream: health passes, GET / -> 404,
+# preload declared failed. Enabling the UI to satisfy the probe would add a
+# Hugging Face download to every weekly rebuild.
+#
+# Warming is done by the router instead (router/llm_router.py, warm_loop): a
+# 1-token request per core model through llama-swap, at boot and every time
+# llama-swap comes back from being down. The preload hook cannot do that second
+# part, and the weekly rebuild restarts llama-swap.
 
 models:
 

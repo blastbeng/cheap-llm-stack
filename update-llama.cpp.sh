@@ -50,6 +50,7 @@ BROKEN_FILE="${STACK_DIR}/.llama-cpp-broken"
 BACKUP_DIR="${STACK_DIR}/.build-backup"
 TOOLCHECK="${SRC_DIR}/scripts/toolcheck.py"
 ROUTER_URL="${ROUTER_URL:-http://127.0.0.1:10000}"
+LLAMA_SWAP_PORT="${LLAMA_SWAP_PORT:-10001}"
 # `vec` is deliberately absent: it exercises an invented identifier inside the
 # arguments, which every model on this board mangles, so it warns rather than
 # fails and adds 20 s without adding signal about the build.
@@ -73,7 +74,7 @@ current="$(cat "${VERSION_FILE}" 2>/dev/null || echo none)"
 
 wait_swap() {
     for _ in $(seq 1 "${1:-60}"); do
-        curl -fsS --max-time 3 "http://127.0.0.1:10001/v1/models" >/dev/null 2>&1 && return 0
+        curl -fsS --max-time 3 "http://127.0.0.1:${LLAMA_SWAP_PORT}/v1/models" >/dev/null 2>&1 && return 0
         sleep 2
     done
     return 1
@@ -81,6 +82,18 @@ wait_swap() {
 
 verify_tools() {
     python3 "${TOOLCHECK}" --url "${ROUTER_URL}" --only "${VERIFY_CASES}"
+}
+
+warm_stack() {
+    # Warm the model the battery is about to use. The router does this too when it
+    # sees llama-swap come back, and whoever gets there first does the load:
+    # llama-swap queues the second request. Without a warm-up the first battery
+    # case measures the MoE load, not the build — measured 93 s for the first tool
+    # case after an update against 17 s for the ones that follow.
+    curl -fsS --max-time 900 -X POST -H 'content-type: application/json' \
+        -d '{"model":"reasoner","messages":[{"role":"user","content":"ok"}],"max_tokens":1,"reasoning_budget_tokens":0}' \
+        "http://127.0.0.1:${LLAMA_SWAP_PORT}/v1/chat/completions" >/dev/null 2>&1 \
+        || warn "warm-up of reasoner failed: the battery starts against a cold model"
 }
 
 backup_build() {
@@ -148,7 +161,7 @@ backup_build
 log "rebuilding llama.cpp $(short "${target}") (this takes ~20-40 min on this board)"
 if LLAMA_CPP_TAG="${target}" "${SRC_DIR}/install.sh" --skip-models --no-apt; then
     # The version string, not the sha: on master the sha says nothing about what
-    # shipped, and this is the line that ends up in `journalctl -u llama-swap-update`.
+    # shipped, and this is the line that ends up in the journal.
     built="$("${STACK_DIR}/bin/llama-server" --version 2>&1 | head -n1 || true)"
     log "build ok: ${built:-$(cat "${VERSION_FILE}" 2>/dev/null)}"
 else
@@ -179,7 +192,9 @@ if ! curl -fsS --max-time 5 "${ROUTER_URL}/health" >/dev/null 2>&1; then
     die "build ${target} is installed but unverified; check systemctl status llm-router"
 fi
 
-log "verifying tool calling on ${target} (${VERIFY_CASES}; ~2 min, the MoE is loading)"
+log "warming reasoner for the battery"
+warm_stack
+log "verifying tool calling on ${target} (${VERIFY_CASES}; ~2 min, all models warm)"
 if ! verify_tools; then
     warn "tool calling regressed on ${target} - retrying once before rolling back"
     if ! verify_tools; then

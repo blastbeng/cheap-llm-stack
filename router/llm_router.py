@@ -321,6 +321,79 @@ def cosine(a: list[float], b: list[float]) -> float:
     return dot / (na * nb + 1e-12)
 
 
+# ------------------------------------------------------------------ warming ---
+# The resident set is warmed here, not by llama-swap's preload hook, and the hook
+# is deliberately absent from config.yaml.
+#
+# llama-swap implements hooks.on_startup.preload as a synthetic `GET /` routed to
+# the model, and the status of that GET is what it calls success (upstream:
+# internal/server/api.go, startPreload). llama.cpp built with
+# -DLLAMA_USE_PREBUILT_UI=OFF (our build; the option fetches a UI bundle from a
+# Hugging Face bucket at build time) registers no `/` route, so
+# every preload logged
+#     [ERROR] failed to preload model <id>: status 404
+# while the model loaded fine. Verified on this board against a stub upstream:
+# health passes, then GET / answers 404 and the preload is declared failed. A
+# permanent false alarm in the only monitor this box has is worse than the
+# silence it replaces, and a preload hook cannot do the two jobs that matter:
+#   * it runs only when llama-swap itself starts. The weekly rebuild restarts
+#     llama-swap, so the first request after an update paid the MoE load: measured
+#     93 s for the first tool case of the battery against 17 s for the rest.
+#   * `GET /` warms nothing but the process. A 1-token completion also warms the
+#     prompt cache and the KV slots, which is what makes a tools+system prefix
+#     cost 4-6 s warm instead of 43 s cold.
+WARM_ENABLED = os.environ.get("ROUTER_WARM", "1") == "1"
+WARM_POLL_SEC = int(os.environ.get("ROUTER_WARM_POLL", "20"))
+# Order matters: the embedding model is what Prototypes.build is waiting for, and
+# the MoE is the slow load, so it goes last and never blocks the front door.
+WARM_MODELS = ("embedding-model", "router", "reasoner")
+# A cold MoE read from microSD is minutes; a warm one is seconds.
+WARM_TIMEOUT = float(os.environ.get("ROUTER_WARM_TIMEOUT", "900"))
+
+
+def warm_model(model: str) -> bool:
+    """One-token request that makes llama-swap load `model` and keeps its caches
+    hot. reasoning_budget_tokens=0 because the reply is thrown away and the
+    cheapest generation is the right one; the budget-0 thinking leak into
+    `content` is not read by anyone here."""
+    t0 = time.time()
+    try:
+        if model.startswith("embedding"):
+            embed(["warm"])
+        else:
+            upstream_json("/v1/chat/completions",
+                          {"model": model,
+                           "messages": [{"role": "user", "content": "ok"}],
+                           "max_tokens": 1, "temperature": 0.0, "stream": False,
+                           "reasoning_budget_tokens": 0},
+                          timeout=WARM_TIMEOUT)
+        log("warm %s in %.1fs" % (model, time.time() - t0))
+        return True
+    except Exception as exc:
+        # Deliberately not fatal: an unwarm model is slow, not broken, and the
+        # next request loads it anyway.
+        log("warn: warm %s failed after %.1fs: %s" % (model, time.time() - t0, exc))
+        return False
+
+
+def warm_loop() -> None:
+    """Warm the resident set at boot and again every time llama-swap comes back
+    from being down — a restart evicts every model, and that is the case a
+    preload hook cannot cover."""
+    pending = True
+    warmed = False
+    while True:
+        if not upstream_ok(timeout=3.0):
+            pending = True
+        elif pending:
+            pending = False
+            log("warming the resident set (%s)" % ("boot" if not warmed else "llama-swap restarted"))
+            for model in WARM_MODELS:
+                warm_model(model)
+            warmed = True
+        time.sleep(WARM_POLL_SEC)
+
+
 class Prototypes:
     """Prototype vectors, built once the embedding model is answering."""
 
@@ -820,6 +893,8 @@ class Server(ThreadingHTTPServer):
 
 def main() -> None:
     log("listening on %s:%d -> llama-swap %s:%d" % (LISTEN_HOST, LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT))
+    if WARM_ENABLED:
+        threading.Thread(target=warm_loop, name="warm", daemon=True).start()
     threading.Thread(target=PROTO.build, name="proto-build", daemon=True).start()
     Server((LISTEN_HOST, LISTEN_PORT), Handler).serve_forever()
 
