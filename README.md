@@ -188,7 +188,10 @@ in it goes to the VLM; embeddings are always on.
 `Anonymous` from `smaps_rollup` with all four loaded: 7.6 GB, `free` reports
 9.5 GB used and 2.4 GB available, no OOM, 64 °C. The ctx bump costs 59 KB/token on
 the 0.6B — measured 905 MB at 4096 vs 1025 MB at 6144, which is exactly the q8_0 KV
-size, so it is the only part that scales.
+size, so it is the only part that scales. Both layers that cap a prompt agree on the
+new number: with a prompt above the window, the proxy's clamp reports
+`"context_tokens": 6144` for `cheap/router`, and `cheap/vision` reaches the board and
+is refused with `available context size (6144 tokens)` — nothing still assumes 4096.
 
 At 16k with four resident models the board needed ~12.5 GB and went into zram swap
 (5.7 GB swapped, 400 MB available) — the MoE then took 5 minutes to answer its
