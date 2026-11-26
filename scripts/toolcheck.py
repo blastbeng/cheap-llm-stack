@@ -2,11 +2,13 @@
 """
 toolcheck.py — does the stack still do OpenAI tool calling?
 
-Seven cases against the router's OpenAI-compatible endpoint: five single-tool
+Eight cases against the router's OpenAI-compatible endpoint: five single-tool
 requests, one that should fan out to two tools, one that must produce no tool call
-at all. The tools are the ones this household actually uses (Telegram, web search,
-memory, Chroma, weather), in Italian and English, which is the language mix the
-board serves.
+at all, and two synthesis turns (the turn after a tool result) — one with a small
+result, one with a real 1.5 kB `web_search` payload, which is the shape that used
+to come back empty. The tools are the ones this household actually uses (Telegram,
+web search, memory, Chroma, weather), in Italian and English, which is the
+language mix the board serves.
 
 Why this exists as a script and not as a one-off:
   * llama.cpp is rebuilt from master every week (llama-swap-update.timer). Tool
@@ -86,13 +88,13 @@ TOOLS = [
 
 # Emitting a call is only half the job: the turn AFTER the tool result is a
 # different prompt with different needs, and it fails differently. Measured on
-# this board: with reasoning_budget_tokens=32 the MoE spends the whole budget
-# thinking and returns finish=stop with an EMPTY content (6 s) -- which an agent
-# client renders as a hang, because no text ever arrives. At 96 the same turn
-# answers normally. The router now sends 96 for exactly this turn
-# (ROUTER_BUDGET_TOOLS_SYNTH), and this case is the regression test for it: it
-# replays a user question, a tool call and a tool result, and requires a
-# non-empty answer with no further call.
+# this board with real web_search output: with reasoning_budget_tokens=32 the MoE
+# spends the whole budget thinking and returns finish=stop with an EMPTY content
+# (6 s) -- which an agent client renders as a hang, because no text ever arrives.
+# 96 and 192 were still 0/3 and 2/3; 256 answers every time, so the router sends
+# 256 for exactly this turn (ROUTER_BUDGET_TOOLS_SYNTH). These cases are the
+# regression test for it: they replay a user question, a tool call and a tool
+# result, and require a non-empty answer with no further call.
 SYNTH_MESSAGES = [
     {"role": "user", "content": "Che tempo fa a Milano domani?"},
     {"role": "assistant", "content": None, "tool_calls": [
@@ -103,6 +105,52 @@ SYNTH_MESSAGES = [
         {"city": "Milano", "tomorrow": {"min_c": 4, "max_c": 13,
                                         "conditions": "nuvoloso con schiarite",
                                         "precipitation_mm": 0.2}})},
+]
+
+# The production shape: a real web_search payload (1.5 kB of titles, urls,
+# snippets and engine names) handed back to the model. Raw like this it used to
+# produce an empty answer; the router now trims it to ROUTER_TOOL_RESULT_MAX_CHARS
+# and the synthesis turn runs at 256 thinking tokens.
+SYNTH_WEB_MESSAGES = [
+    {"role": "user", "content": "Cerca sul web chi è Gerry Scotti e dimmi chi è."},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "web_search",
+                      "arguments": json.dumps({"query": "Gerry Scotti"})}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({
+        "query": "Gerry Scotti", "count": 4, "results": [
+            {"title": "Gerry Scotti - Wikipedia",
+             "url": "https://it.wikipedia.org/wiki/Gerry_Scotti",
+             "snippet": "Gerry Scotti, pseudonimo di Virginio Scotti (Camporinaldo, "
+                        "7 agosto 1956), è un conduttore televisivo, conduttore "
+                        "radiofonico, attore e politico italiano. È uno dei volti "
+                        "storici di Mediaset, dove ha condotto Chi vuol essere "
+                        "milionario?, Passaparola, La ruota della fortuna, Caduta "
+                        "libera.",
+             "engine": "duckduckgo"},
+            {"title": "Gerry Scotti, chi è: carriera e vita privata",
+             "url": "https://www.example.com/spettacolo/gerry-scotti-biografia",
+             "snippet": "Nato a Camporinaldo, frazione di Miradolo Terme (Pavia), "
+                        "figlio unico. Debutta in radio negli anni settanta e in "
+                        "televisione nel 1983; dal 1996 al 2007 conduce il "
+                        "Milionario su Canale 5.",
+             "engine": "bing"},
+            {"title": "Gerry Scotti, dall'esordio a oggi: i programmi cult",
+             "url": "https://www.example.org/tv/gerry-scotti-programmi",
+             "snippet": "Passaparola, La ruota della fortuna, Caduta libera, "
+                        "Chi vuol essere milionario?: i programmi che hanno "
+                        "accompagnato trent'anni di televisione generalista. "
+                        "Nel 2024 è tornato con Caduta libera e con la conduzione "
+                        "di eventi speciali su Canale 5.",
+             "engine": "marginalia"},
+            {"title": "Gerry Scotti - Wikipedia (en)",
+             "url": "https://en.wikipedia.org/wiki/Gerry_Scotti",
+             "snippet": "Virginio Scotti, known as Gerry Scotti, is an Italian "
+                        "television presenter, radio host and actor. He has "
+                        "presented several Mediaset programmes and is one of the "
+                        "best known faces of Italian commercial television.",
+             "engine": "wikipedia"},
+        ]}, ensure_ascii=False)},
 ]
 
 # key, prompt, expected tool name ("NONE" = must not call anything), optional
@@ -121,6 +169,7 @@ CASES = [
     ("none", "Ciao, come stai? Raccontami una barzelletta breve.", "NONE", None),
     # prompt is a message LIST and the expectation is prose, see SYNTH_MESSAGES
     ("synth", SYNTH_MESSAGES, "ANSWER", None),
+    ("synthweb", SYNTH_WEB_MESSAGES, "ANSWER", None),
 ]
 
 QUICK = {"tg", "wx", "none"}
@@ -166,7 +215,8 @@ def main() -> int:
     ap.add_argument("--model", default="auto")
     ap.add_argument("--quick", action="store_true", help="only the three decisive cases")
     ap.add_argument("--only", metavar="KEYS",
-                    help="comma-separated case ids to run (tg, web, mem, vec, wx, multi, none, synth)")
+                    help="comma-separated case ids to run "
+                         "(tg, web, mem, vec, wx, multi, none, synth, synthweb)")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=1234, help="0 = let the server sample")

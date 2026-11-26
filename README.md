@@ -316,7 +316,7 @@ throws away the prompt cache that makes agent traffic affordable. (An earlier
 | `POST /v1/chat/completions` | `model: auto` → router picks; any explicit id bypasses routing |
 | `POST /v1/embeddings` | always forced to `embedding-model` |
 | `GET /v1/models` | llama-swap's list **plus** a synthetic `auto` (tools + vision) |
-| `GET /health` | router + upstream status, per-route map and budgets |
+| `GET /health` | router + upstream status, per-route map and budgets, plus the live `tools_synth_budget` / `tool_result_max_chars` |
 | `GET /stats` | per-route counters, sticky sessions, prototype state |
 
 Response headers `X-Route`, `X-Route-Model`, `X-Route-By`, `X-Route-Ms`,
@@ -349,12 +349,16 @@ check — `tools` wins before the model is picked.
 
 The tool payload is passed through verbatim (`tools`, `tool_choice`,
 `parallel_tool_calls`), no system prompt is injected (it would shift the cached
-prefix), the thinking budget is set to 32, the answer ceiling is raised to at least
-800 tokens so a client's `max_tokens: 200` cannot truncate the call instead of the
-prose, and **temperature is raised to 0.6** (see below). A client that tries to
-switch thinking *off* (`chat_template_kwargs.enable_thinking: false`,
-`reasoning_effort: "none"`) is overruled, because on a reasoning-only model that is
-what pushes the monologue into `content`.
+prefix), the answer ceiling is raised to at least 800 tokens so a client's
+`max_tokens: 200` cannot truncate the call instead of the prose, and **temperature
+is raised to 0.6** (see below). The thinking budget is 32 when the model has to
+*emit* a call and **256** when the last message is a tool result and it has to
+*write the answer* (`ROUTER_BUDGET_TOOLS_SYNTH`); the end-of-turn markers are
+appended to `stop` so the GGUF's literal `</|end_of_sentence|>` cannot leak into
+the answer. A client that tries to switch thinking *off*
+(`chat_template_kwargs.enable_thinking: false`, `reasoning_effort: "none"`) is
+overruled, because on a reasoning-only model that is what pushes the monologue
+into `content`.
 
 Why the temperature floor. Two of the seven cases are temperature-sensitive, and
 not in the direction you would guess — a *cold* sampler answers a tool request in
@@ -443,8 +447,66 @@ So, for every model that shadows a connection id (Workspace → Models, or
    (the tiny tier never gets one, not even when picked by hand) and only
    auto-injects on `cheap/auto`, `cheap/reasoner` and the non-cheap models;
    `cheap/vision` can still opt in manually for the image+tools turn.
+   **The cheap models get `mcp-cheap-flat` instead** — see the next section.
 4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
    over the prompt, and compaction cannot fit a 6k model anyway.
+
+### One flat tool for the cheap models (`mcp-cheap-flat`)
+
+The two-meta-tool surface is a good trade for a large model: ~640 tokens buy 109
+tools. It is a **bad** trade for the 8B-A1B MoE, because it turns one job into
+two decisions and the second one keeps failing:
+
+* `find_tool` → schema, then `run_tool` with the arguments: the model has to
+  carry an opaque payload across a turn. Measured on the same 6-case web
+  battery: **meta-tools 0/6, flat tool 6/6** — the failures were not bad
+  arguments, they were `find_tool` in round 1, `find_tool` again in round 2,
+  `finish=stop` with nothing.
+* `run_tool` also hides the real schema, so the arguments arrive as prose
+  (`{"name": "web_search", "arguments": "query=..."}`) instead of a parsed call.
+
+So the cheap models get a second, **separate** instance of tools-lite that
+advertises one ordinary function, `web_search`, with a curated schema (`query`,
+`count`) and no meta-tools at all:
+
+```yaml
+  mcp-tools-lite-flat:            # identical image/code, different surface
+    image: python:3.12-alpine
+    ports: ["8815:8815"]
+    mem_limit: 192m
+    environment:
+      MCP_LITE_PORT: "8815"
+      MCP_LITE_FLAT_TOOLS: "web_search"
+      MCP_LITE_META_TOOLS: "0"    # no find_tool/run_tool next to it
+      MCP_LITE_FLAT_MAX_RESULTS: "3"
+      MCP_LITE_FLAT_SNIPPET: "220"
+    volumes: ["./tools-lite:/app:ro", "./tools-lite/cache-flat:/cache:rw"]
+```
+
+It is the same `proxy.py` (the MCP stack lives in `/opt/docker/compose/mcp` on
+the media host, not in this repository); the flat surface is opt-in by env, so
+the existing `mcp-tools-lite` on :8814 is untouched, and the new container is
+started with `up -d --no-deps` so nothing else is recreated. The flat reply is rendered for a small
+model rather than dumped: **`title` / `url` / snippet** per result plus
+`(N more results not shown)` — **945 characters** instead of the 1.5 kB JSON,
+which matters twice, because that text comes back in the synthesis prompt (see
+fault 4 below). Seeding `cache-flat/index.json` from `cache/index.json` skips
+the ~100 s semantic index build on the board.
+
+In Open WebUI this is a second MCP connection, `mcp-cheap-flat`
+(`http://host.docker.internal:8815/mcp`, same bearer), and the global `inlet`
+filter (v0.4.0) chooses per model:
+
+```python
+TOOL_IDS       = ["server:mcp:mcp-tools-lite"]   # every non-cheap model
+FLAT_TOOL_IDS  = ["server:mcp:mcp-cheap-flat"]   # cheap/* only
+wanted = FLAT_TOOL_IDS if model_id.startswith("cheap/") else TOOL_IDS
+```
+
+`cheap/router` still gets **no** tools at all. The important property is the one
+that makes this safe: nothing outside `cheap/*` changes — a cloud model
+(`anthropic/claude-sonnet-4.5`, `openai/gpt-5`, …) keeps exactly the tool ids it
+had, and a stale flat id is removed from its list if it is ever there.
 
 Measured with this profile: `cheap/router` carries **50 prompt tokens** and no
 tools at all, `cheap/reasoner` carries **819** with the two meta-tools, 15.7 s
@@ -482,7 +544,7 @@ reachable as `fast` / `tiny` / `lfm3` (and the 0.6B as `router-0.6b`) while hidi
 
 ### Why "search the web" used to hang (measured 26 Nov)
 
-Four faults stacked into one symptom — an answer that never arrives:
+Five faults stacked into one symptom — an answer that never arrives:
 
 1. **The meta-tools were named after the mechanism, not the effect.**
    `tools_search` / `tool_call` read as "search" / "maybe call something", and the
@@ -492,6 +554,9 @@ Four faults stacked into one symptom — an answer that never arrives:
    say that in those words and the `query` description asks for the *action*
    ("search the web for X"), not the user's question. Same two tools, same ~640
    prompt tokens. Old names still dispatch, so existing prompts keep working.
+   This was necessary but **not sufficient**: the indirection itself is beyond
+   the MoE, so the cheap models now get a flat `web_search` instead (0/6 →
+   **6/6**, see the `mcp-cheap-flat` section).
 2. **Ranking lost to verbose descriptions.** Cosine similarity over
    `name + description` put `query-docs` above `web_search` for "search the web
    for the latest news" (4/15 correct top-1 on a labelled set). Two server-side
@@ -503,13 +568,25 @@ Four faults stacked into one symptom — an answer that never arrives:
    (budget 32 is measured 7/7) and write the answer from the tool result. At
    budget 32 the second one returns `finish=stop` with an **empty** `content` in
    6 s — the thought eats the budget and there is nothing left to say, which is
-   exactly what a client shows as a hang. The router now sends
-   `ROUTER_BUDGET_TOOLS_SYNTH=96` (the chat budget) when the last message is a
-   tool result.
-4. **A tool result is re-sent on every following turn.** 12 000 characters of web
-   markdown both overflow the 12k window (empty prompt) and cost seconds of
-   prefill per round. `ROUTER_TOOL_RESULT_MAX_CHARS=6000` trims head+tail with an
-   explicit marker, so the model knows text is missing.
+   exactly what a client shows as a hang. Measured on a replayed synthesis turn
+   with the real `web_search` payload, 3 runs per point: `32 → 0/3`,
+   `96 → 0/3`, `192 → 2/3`, `256 → 3/3` (33 s), `384 → 3/3` (54 s). The router
+   therefore sends `ROUTER_BUDGET_TOOLS_SYNTH=256` when the last message is a
+   tool result, and 32 when it has to emit the call — the asymmetry *is* the fix.
+4. **A tool result is re-sent on every following turn, and its size is what the
+   model thinks about.** The raw 1.5 kB `web_search` JSON (lanes, timings,
+   engines) produced an empty answer at budgets 96–128 (0/3, 1/3); two or three
+   compact `title / url / snippet` lines answer at 256. `ROUTER_TOOL_RESULT_MAX_CHARS`
+   is therefore **1500** (it was 6000), trimmed head+tail with an explicit
+   marker so the model knows text is missing and can re-query. Above ~1500 the
+   JSON also costs seconds of prefill per round, and 12 000 characters of web
+   markdown overflow the window outright.
+5. **The end-of-turn marker leaked as text.** The GGUF carries
+   `</|end_of_sentence|>` as ordinary text pieces, so a degenerate turn *writes*
+   it into the answer — that is the `…dimmi chi è</｜end▁of▁sentence>` row Open
+   WebUI stored on 26 Nov. The router now appends the model's own stop markers
+   (both spellings, plus `<|im_end|>`) to every reasoner request: free, and it
+   never fires on a well-formed turn.
 
 **The iteration cap is deliberately left at -1 (unlimited)** in Open WebUI.
 Capping it at 8 does terminate the bad loop, but it also kills the long agentic
@@ -518,9 +595,11 @@ iterations)". The loop has to end because the tools work, not because the client
 gives up. One chat row did measure 939 s with `content: ""` before these fixes —
 that row was the model re-searching, not the cap.
 
-`scripts/toolcheck.py` has an eighth case, **`synth`**, that replays a
-question + tool call + tool result and requires a non-empty answer with no
-further call: that is the regression test for faults 3 and 4.
+`scripts/toolcheck.py` has two synthesis cases, **`synth`** (a small weather
+result) and **`synthweb`** (a 1.5 kB `web_search` payload, the production
+shape): each replays a question + tool call + tool result and requires a
+non-empty answer with no further call. Those are the regression tests for
+faults 3, 4 and 5.
 
 ### The other half: the board is shared, and an abandoned request owns it
 
@@ -563,7 +642,7 @@ sudo ./install.sh --prune-models  # delete GGUFs that are not part of the stack
 sudo ./scripts/tune.sh --check    # show unapplied OS tuning
 sudo ./scripts/tune.sh --apply    # swappiness, noatime, governor, zram checks
 ./healthcheck.sh                  # quick liveness of both tiers
-./healthcheck.sh --tools          # + the 8-case tool-calling battery
+./healthcheck.sh --tools          # + the 9-case tool-calling battery
 ./scripts/toolcheck.py            # tool calling on its own (--quick, --stream, --model)
 ./benchmark.sh --all              # pp/tg per model, embedding latency
 sudo ./update-llama.cpp.sh        # rebuild llama.cpp at the tip of master (the timer runs it weekly)

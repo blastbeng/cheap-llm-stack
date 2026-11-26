@@ -118,17 +118,25 @@ ROUTE_BUDGET = {
 TOOLS_MIN_MAX_TOKENS = int(os.environ.get("ROUTER_TOOLS_MIN_MAX_TOKENS", "800"))
 # A tool turn is two different jobs and they want opposite budgets.
 #   * emitting a call  -> 32 tokens of thinking is measured 7/7 at 17-19 s;
-#   * writing the answer from the tool result -> 32 is a trap: measured on a
-#     replayed synthesis turn, budget 32 returns finish=stop with an EMPTY
-#     content in 6 s (the whole thought is spent on the budget, nothing is left
-#     to answer), while 96 produces the answer. An empty answer is exactly what
-#     Open WebUI shows as a hang, so the synthesis turn runs at the chat budget.
-TOOLS_SYNTH_BUDGET = int(os.environ.get("ROUTER_BUDGET_TOOLS_SYNTH", "96"))
-# A tool result is re-sent on every following turn. 12k of web markdown both
-# overflows the 12k window (the answer then gets an empty prompt) and costs
-# seconds of prompt processing per round. Keep head + tail: the head carries the
-# match, the tail carries the date/source footer.
-TOOL_RESULT_MAX_CHARS = int(os.environ.get("ROUTER_TOOL_RESULT_MAX_CHARS", "6000"))
+#   * writing the answer from the tool result -> the thinking has to FIT, or the
+#     model stops with an EMPTY answer (the whole budget is spent thinking and
+#     nothing is left to say). Measured on a replayed synthesis turn with real
+#     web_search output (LFM2.5-8B-A1B, Open WebUI payload, 3 runs per point):
+#       budget  32 -> 0/3 answers   (6 s: pure loss)
+#       budget  96 -> 0/3 answers   (the old value)
+#       budget 192 -> 2/3 answers   (20-35 s)
+#       budget 256 -> 3/3 answers with a compact result (33 s)
+#       budget 384 -> 3/3 answers, 54 s
+#     An empty answer is exactly what Open WebUI shows as a hung chat, and a
+#     32-token cap on the *call* turn plus a 256-token cap on the *answer* turn
+#     is the pair that makes both jobs work.
+TOOLS_SYNTH_BUDGET = int(os.environ.get("ROUTER_BUDGET_TOOLS_SYNTH", "256"))
+# A tool result is re-sent on every following turn, and its size is what the
+# model thinks about: the raw 1.5 kB web_search JSON (lanes, timings) produced an
+# empty answer at budget 96-128 (0/3, 1/3), while two or three compact
+# "title / url / snippet" lines answer at budget 256. Keep head + tail but keep
+# it small: the head carries the match, the tail carries the date/source footer.
+TOOL_RESULT_MAX_CHARS = int(os.environ.get("ROUTER_TOOL_RESULT_MAX_CHARS", "1500"))
 # Below this the MoE answers a tool request in prose instead of emitting the call.
 # Measured, see apply_route_knobs. 0 disables the floor.
 TOOLS_MIN_TEMPERATURE = float(os.environ.get("ROUTER_TOOLS_MIN_TEMPERATURE", "0.6"))
@@ -615,6 +623,29 @@ def normalize_reasoning(body: dict) -> dict:
     return body
 
 
+# The MoE's chat template ends a turn with `</|end_of_sentence|>`, but its GGUF
+# carries that marker as ordinary text pieces rather than as a control token: on
+# a degenerate turn the model *writes* it into the answer. That is exactly what
+# Open WebUI stored on 26 Nov ("Cerca gerry scotti sul web e dimmi chi è</｜
+# end▁of▁sentence>") and showed to the user. A stop string is free and keeps the
+# garbage out of the client; it never fires on a well-formed turn because a real
+# tool call arrives as a parsed `tool_calls`, not as text.
+STOP_MARKERS = ("</|end_of_sentence|>", "</｜end▁of▁sentence>", "<|im_end|>")
+
+
+def add_stop_markers(body: dict) -> dict:
+    """Append the model's own end-of-turn markers to whatever stop list exists."""
+    stops = body.get("stop")
+    if isinstance(stops, str):
+        stops = [stops]
+    elif not isinstance(stops, list):
+        stops = []
+    added = [m for m in STOP_MARKERS if m not in stops]
+    if added:
+        body["stop"] = stops + added
+    return body
+
+
 def awaiting_tool_answer(messages: list[dict]) -> bool:
     """The last turn handed back tool output: this turn writes the answer."""
     for m in reversed(messages):
@@ -885,7 +916,7 @@ class Handler(BaseHTTPRequestHandler):
                     model = ROUTE_MODEL["tools"]
                     body["model"] = model
                     body = apply_route_knobs(body, "tools")
-                    body = normalize_reasoning(body)
+                    body = add_stop_markers(normalize_reasoning(body))
                     bump("tools")
                     log("route=tools model=%s by=tools-on-tiny (client asked %s)"
                         % (model, requested))
@@ -900,7 +931,7 @@ class Handler(BaseHTTPRequestHandler):
             body["model"] = model
             body = apply_route_knobs(body, route)
             if route != "fast":
-                body = normalize_reasoning(body)
+                body = add_stop_markers(normalize_reasoning(body))
             if route == "fast":
                 body = keep_language(body)
             elapsed = (time.time() - t0) * 1000.0
