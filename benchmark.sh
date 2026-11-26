@@ -44,13 +44,18 @@ if [ "${DO_BENCH}" = 1 ]; then
     log "llama-bench (threads=${THREADS}, batch=${BATCH_THREADS})"
     for gguf in \
         "Qwen3-Embedding-0.6B-Q8_0.gguf" \
+        "LFM3-1.7B-QAD-Q4_0.gguf" \
         "Qwen3-0.6B-Q8_0.gguf" \
         "LFM2.5-8B-A1B-Q4_0.gguf" \
         "LFM3-VL-2B-QAD-Q4_0.gguf"
     do
         [ -s "${MODELS}/${gguf}" ] || { log "skip ${gguf} (not downloaded)"; continue; }
         log "  ${gguf}"
+        # Same KV config the stack runs (q8_0 needs flash-attn), otherwise the
+        # numbers describe a setup nobody deploys: f16 KV is ~2x the memory and
+        # measurably slower to fill.
         "${BIN}" -m "${MODELS}/${gguf}" \
+            -fa on -ctk q8_0 -ctv q8_0 \
             -t "${THREADS},${BATCH_THREADS}" \
             -p 512 -n 128 -r 2 -o md 2>/dev/null \
             | grep -E '^\|' || true

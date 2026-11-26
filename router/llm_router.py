@@ -116,6 +116,19 @@ ROUTE_BUDGET = {
 # answer at 200 tokens truncates the call instead of the prose, which the agent then
 # never sees. Raise the ceiling on tool turns only, never lower a client's value.
 TOOLS_MIN_MAX_TOKENS = int(os.environ.get("ROUTER_TOOLS_MIN_MAX_TOKENS", "800"))
+# A tool turn is two different jobs and they want opposite budgets.
+#   * emitting a call  -> 32 tokens of thinking is measured 7/7 at 17-19 s;
+#   * writing the answer from the tool result -> 32 is a trap: measured on a
+#     replayed synthesis turn, budget 32 returns finish=stop with an EMPTY
+#     content in 6 s (the whole thought is spent on the budget, nothing is left
+#     to answer), while 96 produces the answer. An empty answer is exactly what
+#     Open WebUI shows as a hang, so the synthesis turn runs at the chat budget.
+TOOLS_SYNTH_BUDGET = int(os.environ.get("ROUTER_BUDGET_TOOLS_SYNTH", "96"))
+# A tool result is re-sent on every following turn. 12k of web markdown both
+# overflows the 12k window (the answer then gets an empty prompt) and costs
+# seconds of prompt processing per round. Keep head + tail: the head carries the
+# match, the tail carries the date/source footer.
+TOOL_RESULT_MAX_CHARS = int(os.environ.get("ROUTER_TOOL_RESULT_MAX_CHARS", "6000"))
 # Below this the MoE answers a tool request in prose instead of emitting the call.
 # Measured, see apply_route_knobs. 0 disables the floor.
 TOOLS_MIN_TEMPERATURE = float(os.environ.get("ROUTER_TOOLS_MIN_TEMPERATURE", "0.6"))
@@ -137,9 +150,10 @@ ROUTE_MODEL = {
     "embedding": "embedding-model",
 }
 
-# Every llama-swap alias that resolves to the 0.6B. A tool turn addressed to one of
-# these is redirected to the tools route (see Handler.do_POST).
-TINY_MODELS = {"router", "router-0.6b", "fast", "tiny"}
+# The fast tier and every alias that resolves to it. A tool turn addressed to one of
+# these is redirected to the tools route (see Handler.do_POST): the MoE scores 8/8
+# there at 10.4 tok/s and LFM3-1.7B scores 7/8, so tools stay on the MoE.
+TINY_MODELS = {"router", "router-0.6b", "fast", "tiny", "tiny-0.6b", "lfm3"}
 
 # --------------------------------------------------------------- prototypes ---
 # One short utterance per intent, in English and Italian (this stack is used in
@@ -601,8 +615,65 @@ def normalize_reasoning(body: dict) -> dict:
     return body
 
 
+def awaiting_tool_answer(messages: list[dict]) -> bool:
+    """The last turn handed back tool output: this turn writes the answer."""
+    for m in reversed(messages):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("tool", "function"):
+            return True
+        content = m.get("content")
+        if role == "user" and isinstance(content, list):
+            for chunk in content:
+                if isinstance(chunk, dict) and str(chunk.get("type", "")).startswith("tool"):
+                    return True
+        return False
+    return False
+
+
+def cap_tool_results(messages: list[dict], limit: int = TOOL_RESULT_MAX_CHARS) -> int:
+    """Trim `role: tool` payloads in place; returns how many were cut.
+
+    Nothing is invented: a head/tail excerpt plus an explicit marker, so the model
+    knows text is missing and can ask the tool again with a narrower query.
+    """
+    if limit <= 0:
+        return 0
+    cut = 0
+
+    def _cap(value):
+        nonlocal cut
+        if not isinstance(value, str) or len(value) <= limit:
+            return value
+        head = int(limit * 0.8)
+        tail = limit - head
+        cut += 1
+        return ("%s\n\n[... %d characters cut by the router: re-run the tool with a "
+                "narrower query if the missing part matters ...]\n\n%s"
+                % (value[:head], len(value) - limit, value[-tail:]))
+
+    for m in messages:
+        if not isinstance(m, dict) or m.get("role") not in ("tool", "function"):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            m["content"] = _cap(content)
+        elif isinstance(content, list):
+            for chunk in content:
+                if isinstance(chunk, dict) and chunk.get("type") == "text":
+                    chunk["text"] = _cap(chunk.get("text"))
+    return cut
+
+
 def apply_route_knobs(body: dict, route: str) -> dict:
     """Per-route sampling knobs: thinking budget, a token floor, a temperature floor."""
+    msgs = body.get("messages") or []
+    if route == "tools" and awaiting_tool_answer(msgs):
+        # Budget is only injected when the client has not chosen one, same rule as
+        # every other route.
+        if "reasoning_budget_tokens" not in body and "thinking_budget_tokens" not in body:
+            body["reasoning_budget_tokens"] = TOOLS_SYNTH_BUDGET
     if "reasoning_budget_tokens" not in body and "thinking_budget_tokens" not in body:
         budget = ROUTE_BUDGET.get(route)
         if budget is not None:
@@ -767,6 +838,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body = {"status": "ok", "upstream": "http://%s:%d" % (UPSTREAM_HOST, UPSTREAM_PORT),
                     "routes": ROUTE_MODEL, "budgets": ROUTE_BUDGET,
+                    "tools_synth_budget": TOOLS_SYNTH_BUDGET,
+                    "tool_result_max_chars": TOOL_RESULT_MAX_CHARS,
                     "context_length": CONTEXT_LENGTH,
                     "prototypes_ready": PROTO.ready.is_set()}
             if not upstream_ok("/health"):
@@ -796,13 +869,16 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw or b"{}")
             except Exception:
                 return self._json(400, {"error": {"message": "invalid json"}})
+            cut = cap_tool_results(body.get("messages") or [])
+            if cut:
+                log("capped %d tool result(s) at %d chars" % (cut, TOOL_RESULT_MAX_CHARS))
             requested = str(body.get("model") or "auto")
             if requested and requested.lower() not in ("auto", "router", "orchestrator"):
                 # A concrete id is forwarded verbatim (that is how a client debugs one
-                # tier), with one exception: a tool request must never land on the 0.6B.
-                # It emits a call 7/7 but mangles the arguments, and on a small context
-                # the schema block alone is most of the prompt. Tool orchestration lives
-                # on the MoE, so this is a redirect, not a downgrade.
+                # tier), with one exception: a tool request must never land on the fast
+                # tier. LFM3-1.7B does emit calls (7/8 at Q4_0, 8/8 at Q8_0) but the 8B
+                # MoE is 8/8 at the same 10.4 tok/s, and the 0.6B mangles arguments.
+                # Tool orchestration lives on the MoE, so this is not a downgrade.
                 if requested.lower() in TINY_MODELS and (
                     has_tools(body) or has_tool_history(body.get("messages") or [])
                 ):

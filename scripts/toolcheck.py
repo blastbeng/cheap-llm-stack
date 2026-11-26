@@ -84,6 +84,27 @@ TOOLS = [
             "required": ["city"]}}},
 ]
 
+# Emitting a call is only half the job: the turn AFTER the tool result is a
+# different prompt with different needs, and it fails differently. Measured on
+# this board: with reasoning_budget_tokens=32 the MoE spends the whole budget
+# thinking and returns finish=stop with an EMPTY content (6 s) -- which an agent
+# client renders as a hang, because no text ever arrives. At 96 the same turn
+# answers normally. The router now sends 96 for exactly this turn
+# (ROUTER_BUDGET_TOOLS_SYNTH), and this case is the regression test for it: it
+# replays a user question, a tool call and a tool result, and requires a
+# non-empty answer with no further call.
+SYNTH_MESSAGES = [
+    {"role": "user", "content": "Che tempo fa a Milano domani?"},
+    {"role": "assistant", "content": None, "tool_calls": [
+        {"id": "call_1", "type": "function",
+         "function": {"name": "get_weather",
+                      "arguments": json.dumps({"city": "Milano", "unit": "celsius"})}}]},
+    {"role": "tool", "tool_call_id": "call_1", "content": json.dumps(
+        {"city": "Milano", "tomorrow": {"min_c": 4, "max_c": 13,
+                                        "conditions": "nuvoloso con schiarite",
+                                        "precipitation_mm": 0.2}})},
+]
+
 # key, prompt, expected tool name ("NONE" = must not call anything), optional
 # argument check: (field, expected substring)
 CASES = [
@@ -98,15 +119,27 @@ CASES = [
     ("multi", "Cerca sul web il prezzo attuale del Bitcoin e poi mandamelo su Telegram.",
      "web_search", None),
     ("none", "Ciao, come stai? Raccontami una barzelletta breve.", "NONE", None),
+    # prompt is a message LIST and the expectation is prose, see SYNTH_MESSAGES
+    ("synth", SYNTH_MESSAGES, "ANSWER", None),
 ]
 
 QUICK = {"tg", "wx", "none"}
 
 
-def post(url: str, payload: dict, stream: bool, timeout: float):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
-    resp = urllib.request.urlopen(req, timeout=timeout)
+def post(url: str, payload: dict, stream: bool, timeout: float, retries: int = 6):
+    # llama-swap answers 429 concurrency_limit instead of queueing, so a busy
+    # board (a phone, Home Assistant, a second tab) makes a single-shot battery
+    # fail for a reason that has nothing to do with tool calling. Wait and retry.
+    for attempt in range(retries):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 or attempt == retries - 1:
+                raise
+            time.sleep(10)
     if not stream:
         return json.loads(resp.read()), resp.headers
 
@@ -133,7 +166,7 @@ def main() -> int:
     ap.add_argument("--model", default="auto")
     ap.add_argument("--quick", action="store_true", help="only the three decisive cases")
     ap.add_argument("--only", metavar="KEYS",
-                    help="comma-separated case ids to run (tg, web, mem, vec, wx, multi, none)")
+                    help="comma-separated case ids to run (tg, web, mem, vec, wx, multi, none, synth)")
     ap.add_argument("--stream", action="store_true")
     ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--seed", type=int, default=1234, help="0 = let the server sample")
@@ -155,7 +188,8 @@ def main() -> int:
     ok = 0
     warned = 0
     for key, prompt, expect, argcheck in cases:
-        payload = {"model": args.model, "messages": [{"role": "user", "content": prompt}],
+        messages = prompt if isinstance(prompt, list) else [{"role": "user", "content": prompt}]
+        payload = {"model": args.model, "messages": messages,
                    "tools": TOOLS, "tool_choice": "auto",
                    "temperature": args.temperature, "max_tokens": 400}
         if args.budget is not None:
@@ -177,7 +211,11 @@ def main() -> int:
         message = (data.get("choices") or [{}])[0].get("message") or {}
         calls = message.get("tool_calls") or []
         names = [c.get("function", {}).get("name") for c in calls]
-        passed = (expect == "NONE" and not calls) or (expect in names)
+        if expect == "ANSWER":
+            # the synthesis turn: text must arrive, and no second call is needed
+            passed = bool((message.get("content") or "").strip()) and not calls
+        else:
+            passed = (expect == "NONE" and not calls) or (expect in names)
 
         detail = ""
         if calls:

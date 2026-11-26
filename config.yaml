@@ -4,11 +4,15 @@
 # Design rules (measured, see README):
 #   * generation threads = 2 (one per A76); batch/prefill threads = 8 (all cores). Never raise -t above 2.
 #   * KV cache is quantized to q8_0 (needs --flash-attn on) => half the KV footprint.
-#   * context 12288: measured against 8192 on the workhorse it costs +20 MB of anonymous
-#     memory and 0.00 tok/s of decode speed (10.32 vs 10.31 t/s), so the extra 4k of
-#     conversation room — which an agent client burns fast with tool schemas and
-#     tool results — is free. Do not raise it further: an 8k prompt already costs
-#     ~5 minutes of prefill at ~25 tok/s, and the KV only grows the anon set.
+#   * context 16384 for the MoE. Allocating context is nearly free on this model: it
+#     has attention KV in only 6 of its 24 layers (the other 18 are gated shortconv
+#     with a constant-size state), so 4096 -> 40960 moved the anonymous set by
+#     4705 -> 4881 MB (4.8 MB per 1000 tokens) with pp/tg unchanged (34.3/9.03 t/s
+#     at a 1.5k-token prompt at every ctx size). 12288 -> 16384 costs +19 MB.
+#     What is *not* free is filling it: prefill 34.3 t/s at 1.5k prompt tokens,
+#     23.4 at 5.7k, 17.0 at 9.6k; decode 9.0 -> 6.0 -> 4.8 t/s on the same points.
+#     So 16384 buys an agent client room for tool results, and a full window is a
+#     6-10 minute turn — the reason tool results are capped at 6000 chars upstream.
 #   * the text workhorse is a Mixture-of-Experts (LFM2.5-8B-A1B): 8.3B total weights but
 #     only ~1.5B active per token, so it decodes at ~10.4 tok/s — faster than the dense 2B
 #     (6.3 tok/s) and better on every blind-graded prompt. On a bandwidth-bound board MoE
@@ -59,7 +63,7 @@ routing:
       groups:
         # Always resident (swap:false = all members run together, persistent = never evicted).
         # exclusive:false so that loading the VLM never unloads this group.
-        #   embedding 0.7 GB + router 0.96 GB + reasoner ~6.4 GB at 12k ctx
+        #   embedding 0.7 GB + router 1.0 GB + reasoner ~4.7 GB at 16k ctx
         core:
           swap: false
           exclusive: false
@@ -123,15 +127,44 @@ models:
       embeddings: true
 
   # ------------------------------------------------------------- fast tier ---
-  # Tiny model for one-line answers. Measured on the board: a 40-token chitchat reply
-  # takes 1.05 s here versus 4.0 s on the MoE, so the 0.96 GB it costs is the cheapest
-  # latency win in the stack. It must never see a tool request: it does emit tool_calls
-  # (7/7) but mangles the arguments and writes poor prose, so the router keeps
-  # `tools` on the MoE and only sends greetings, one-liners and short translations here.
-  # The id is plain `router` because that is how it is reached: the front door decides
-  # on this model for trivial turns. `router-0.6b` stays as an alias for debugging.
+  # LFM3-1.7B (dense, new tri-hybrid backbone: 13 gated shortconv + 5 sliding-window
+  # + 6 global attention layers, 256K trained context). Measured against the Qwen3-0.6B
+  # it replaces: pp512 t2 41.4 / t8 62.9 vs 16.4 / ~92, decode 10.1 tok/s at t2 — i.e.
+  # the same decode as the 8B MoE with 1.8x the prefill and 1/4.5 the RAM, so a
+  # one-line answer costs ~4 s instead of 1 s but is coherent and the 1 GB resident
+  # set is the same as the 0.6B's. Native tool calling too (7/8 on the 8-case battery
+  # at Q4_0, 8/8 at Q8_0, which costs 40 % decode) — the router still keeps tool turns
+  # on the MoE because 8/8 at 10.4 tok/s beats 7/8. Thinking on, budget 32: the
+  # template thinks by default and the doc says leave it on.
   router:
-    name: "Qwen3-0.6B · fast tier · chitchat only"
+    name: "LFM3-1.7B · fast tier · chitchat + one-liners"
+    cmd: >
+      ${llama_bin}
+      -m ${models_dir}/LFM3-1.7B-QAD-Q4_0.gguf
+      --host 127.0.0.1 --port ${PORT}
+      ${thr_args}
+      --ctx-size 8192 ${kv_args}
+      ${gen_args}
+      --reasoning on --reasoning-budget 32
+      --alias router
+      --load-mode mmap
+    ttl: 0
+    aliases:
+      - fast
+      - tiny
+      - lfm3
+    checkEndpoint: /health
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
+
+  # The 0.6B stays installed and addressable, not resident: it answers a 40-token
+  # chitchat reply in 1.05 s where anything bigger needs seconds, so it is the tool
+  # to reach for when latency matters more than prose. It must never see a tool
+  # request: it does emit tool_calls (7/7) but mangles the arguments.
+  router-0.6b:
+    name: "Qwen3-0.6B · 1 s chitchat · optional"
     cmd: >
       ${llama_bin}
       -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
@@ -141,13 +174,11 @@ models:
       --ctx-size 6144 ${kv_args}
       ${gen_args}
       --reasoning off
-      --alias router
+      --alias router-0.6b
       --load-mode mmap
-    ttl: 0
+    ttl: 300
     aliases:
-      - router-0.6b
-      - fast
-      - tiny
+      - tiny-0.6b
     checkEndpoint: /health
     capabilities:
       in: [text]
@@ -175,7 +206,7 @@ models:
       -m ${models_dir}/LFM2.5-8B-A1B-Q4_0.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
-      --ctx-size 12288 ${kv_args}
+      --ctx-size 16384 ${kv_args}
       ${gen_args}
       --reasoning on --reasoning-budget 32
       --alias reasoner

@@ -14,6 +14,9 @@ Environment=ROUTER_PORT=10000
 Environment=LLAMA_SWAP_HOST=127.0.0.1
 Environment=LLAMA_SWAP_PORT=10001
 Environment=PYTHONUNBUFFERED=1
+# Advertised window. Must match the `reasoner` --ctx-size in config.yaml: this is
+# what /v1/models and /health report, and what agent clients budget against.
+Environment=ROUTER_CONTEXT_LENGTH=16384
 ExecStart=/usr/bin/python3 /opt/cheap-llm-stack/router/llm_router.py
 Restart=always
 RestartSec=3

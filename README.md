@@ -12,14 +12,15 @@ client ──► :10000  llm-router          content-aware orchestrator (Python,
               ▼
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
               ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
-              ├── reasoner              LFM2.5-8B-A1B  MoE Q4_0  12k   CORE, text + TOOLS
-              ├── router                Qwen3-0.6B            Q8_0   6k   CORE, chitchat only
-              └── vision                LFM3-VL-2B  QAD-Q4_0       6k   heavy, images / OCR
+              ├── reasoner              LFM2.5-8B-A1B  MoE Q4_0  16k   CORE, text + TOOLS
+              ├── router                LFM3-1.7B     QAD-Q4_0   8k   CORE, chitchat / one-liners
+              └── vision                LFM3-VL-2B    QAD-Q4_0   6k   heavy, images / OCR
 ```
 
-Four models, one job each. Anything that needs to think, write or call a tool goes
-to the 8B MoE; anything that is a greeting goes to the 0.6B; anything with a pixel
-in it goes to the VLM; embeddings are always on.
+Four ids, one job each (plus the optional 0.6B). Anything that needs to think, write or call a tool goes
+to the 8B MoE; greetings, one-liners and short translations go to the 1.7B (with the
+0.6B kept installed for when 1 s latency matters more than prose); anything with a
+pixel in it goes to the VLM; embeddings are always on.
 
 ## Why this shape
 
@@ -27,11 +28,12 @@ in it goes to the VLM; embeddings are always on.
   bandwidth, so bigger dense models are strictly slower. Measured on this exact
   board with `llama-bench` (q8_0 KV, flash-attn on, `--threads 2`):
 
-  | model | file | tg (tok/s) | pp (tok/s) |
-  | --- | --- | --- | --- |
-  | Qwen3-0.6B Q8_0 | 0.62 GB | **16.2** | 92 (`-t 2`) / 125 (`-t 8`) |
-  | **LFM2.5-8B-A1B (MoE) Q4_0** | 4.85 GB | **11.6** | 22.6 (`-t 2`) / 34.8 (`-t 8`) |
-  | **LFM3-VL-2B QAD-Q4_0** | 1.05 GB | **8.1** | 33.1 (`-t 8`) |
+  | model | file | tg (tok/s) | pp (tok/s) | note |
+  | --- | --- | --- | --- | --- |
+  | Qwen3-0.6B Q8_0 | 0.62 GB | **16.2** | 92 (`-t 2`) / 125 (`-t 8`) | optional 1 s tier |
+  | **LFM2.5-8B-A1B (MoE) Q4_0** | 4.85 GB | **11.6** | 22.6 (`-t 2`) / 34.8 (`-t 8`) | shipped, default + tools |
+  | **LFM3-1.7B QAD-Q4_0** | 1.05 GB | **10.1** | 41.4 (`-t 2`) / 62.9 (`-t 8`) | shipped, fast tier |
+  | **LFM3-VL-2B QAD-Q4_0** | 1.05 GB | **8.1** | 33.1 (`-t 8`) | shipped, vision |
   | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | 6.3 | 34 (`-t 8`) | not shipped |
   | LFM2-8B-A1B (MoE) Q4_0 | 4.41 GB | 11.7 | 35.0 (`-t 8`) | replaced by LFM2.5 |
   | Qwen3-VL-2B UD-Q4_K_XL | 1.05 GB | 7.5 | — | replaced by LFM3-VL |
@@ -71,6 +73,32 @@ in it goes to the VLM; embeddings are always on.
   This build has a dedicated native handler for the LFM2.5 chat template
   (`common/chat.cpp: common_chat_params_init_lfm2_5`), so calls are generated
   through a PEG grammar rather than the lossy generic parser.
+
+### Model sweep, 26 Nov 2026 (8-case battery = the 7 above + the synthesis turn)
+
+Everything new that fits an 8B-A1B budget was tried: custom fine-tunes, abliterated
+and uncensored merges, imatrix quants, the Ling-3.0-tiny family, the new LFM3
+backbone. Same harness for all (`ctx 12288`, q8_0 KV, `--threads 2/8`, budget 32,
+temperature 0.6, seeded tool battery; six fixed quality cases):
+
+| model | quant | file | t2 pp512 / tg64 | tools | verdict |
+| --- | --- | --- | --- | --- | --- |
+| **LFM2.5-8B-A1B** | Q4_0 | 4.50 GiB | 22.98 / 10.37 | **8/8** | baseline, still the best text+tools |
+| **LFM3-1.7B** | QAD-Q4_0 | 0.99 GiB | **41.44 / 10.13** | 7/8 | **shipped as the fast tier**: 1.8× prefill, same decode, 1/4.5 the RAM, 256K ctx |
+| LFM3-1.7B | Q8_0 | 1.85 GiB | 29.77 / 6.11 | 8/8 | 8/8 tools but 40 % less decode — Q4_0 wins |
+| Moon-Beam-8B-A1B (Ling-3.0-tiny + engram) | IQ4_XS | 4.49 GiB | 20.31 / 8.39 | 8/8 | good prose, but 20 % less decode and reasoning leaks into `content` |
+| edge0-8b (Ling-3.0-tiny) | Q4_1 | 4.65 GiB | 12.90 / 8.56 | 8/8 | slowest prefill of the 8B class, same leak |
+| LFM2.5-8B-A1B-Uncensored | IQ4_XS | 4.29 GiB | 15.14 / 9.65 | 8/8 | works, but −34 % prefill and it answers Italian prompts in English |
+| LFM2.5-8B-A1B-Hermes-Abliterated | IQ3_XXS | 3.33 GB | bench stalls | — | unusable on this build |
+| LFM2.5-Q3.8-TBrilliance-NEO-MAX | IQ4_XS | 4.55 GiB | 15.04 / **2.53** | — | 4× slower decode, misattributes the Commedia → reject |
+| EuroMoE-2.6B-A0.6B | Q4_K_M | 1.62 GB | — | — | `ggml-impl.h` fatal error: unsupported quant/arch |
+
+Tool numbers are not the whole story: all of these models are the same generation
+and share the same flaws (the shipped MoE also leaks a little thinking into
+`content` on extraction, and also got the 14:35+2h50 arithmetic wrong), but on the
+six quality cases the MoE is the only one that gets the Italian facts right *and*
+it has the fastest decode. That, plus 20–34 % less prefill for every IQ4_XS
+candidate, is why nothing replaced the workhorse.
 
 * **The thinking budget is a real knob, not a formality.** `reasoning_budget_tokens`
   (per request, `--reasoning-budget` server-side) is what keeps LFM2.5 honest:
@@ -119,10 +147,31 @@ in it goes to the VLM; embeddings are always on.
   the compute buffers small *and* keeps the tool-schema block in the slot's prompt
   cache. It is also why `reasoner` has `ttl: 0` — an unload throws that cache away.
 
-* **Context 12288, measured against 8192.** Same prompt, same build: 8192 →
-  10.32 tok/s and 4.62 GB anon; 12288 → 10.31 tok/s and 4.64 GB anon. The extra
-  4k of conversation room (which tool results eat fast) is free; going further is
-  not, because an 8k prompt already costs ~5 min of prefill at ~25 tok/s.
+* **Allocating context is nearly free; filling it is not.** `LFM2.5-8B-A1B` has
+  attention KV in only 6 of its 24 layers — the other 18 are gated shortconv with a
+  constant-size state — so the window costs **~4.8 MB per 1000 tokens** and changes
+  nothing else. Measured with the same 1.5k-token prompt (`--threads 2/8`,
+  `--parallel 1`, q8_0 KV):
+
+  | `--ctx-size` | 4096 | 8192 | 12288 | 16384 | 24576 | 32768 | 40960 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `Anonymous` | 4705 MB | 4725 | 4744 | 4764 | 4803 | 4842 | 4881 |
+  | pp / tg | 34.3 / 9.03 | 34.3 / 9.03 | 34.3 / 9.03 | 34.3 / 9.01 | 34.3 / 9.01 | 34.2 / 9.01 | 34.3 / 9.03 |
+
+  What costs is the prompt: prefill and decode fall with depth, and the needle at
+  the start of the prompt was still retrieved at every one of these points, so the
+  quality holds while the latency does not:
+
+  | prompt tokens | 1.5k | 1.9k | 2.6k | 5.7k | 7.7k (93 % of 8k) | 9.6k | 14.3k |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | pp (tok/s) | 34.3 | 33.1 | 31.2 | 23.4 | 17.7 | 17.0 | 13.7 |
+  | tg (tok/s) | 9.03 | 8.68 | 8.20 | 6.03 | 4.52 | 4.77 | 3.76 |
+
+  Hence **16384**, not 12288: +19 MB anon for 4k more room, because an agent client
+  burns context with tool schemas and tool results. 24576 and 32768 are affordable
+  too (+59 / +98 MB) — they are a policy choice, not a memory one: a full 16k turn
+  is a 6–10 minute prefill, which is why tool results are capped at 6000 chars
+  upstream. The model itself was trained for 128k.
 
 * **There is no thinking tier, and that is a measurement.** A 4B dense model
   decodes at 3.0 tok/s here, a 2B at ~6: with `--reasoning-budget 256` the 4B
@@ -137,7 +186,7 @@ in it goes to the VLM; embeddings are always on.
   3.09 (n=8). Drafts are rejected.
 
 * **Model swaps are the real cost.** Weights live on the microSD (~20–45 MB/s), a
-  cold load costs 40–110 s. The resident set is embedding + 0.6B + MoE ≈ 6.5 GB,
+  cold load costs 40–110 s. The resident set is embedding + 1.7B + MoE ≈ 6.4 GB,
   which covers every text and tool request and leaves several GB of page cache for
   the VLM; the VLM lives in the `heavy` swap group so it can never push RAM into
   swap. After a first load, weights stay in page cache, so reloading costs ~13 s.
@@ -146,6 +195,25 @@ in it goes to the VLM; embeddings are always on.
   `llama.cpp` backend and no `/dev/galcore`; `ggml` CPU (NEON dotprod + fp16) is
   the only path. `i8mm` and `SVE` are absent, so the build pins
   `-march=armv8.2-a+dotprod+fp16`.
+
+* **Q4_0 is the fastest 4-bit format here, and repacking is why.** Same
+  LFM2.5-8B-A1B weights, same q8_0 KV, `llama-bench -t 2,8 -p 512 -n 64`:
+
+  | quant | file | t2 pp512 | t2 tg64 | t8 pp512 | t8 tg64 |
+  | --- | --- | --- | --- | --- | --- |
+  | **Q4_0 (shipped)** | 4.50 GiB | **22.98** | **10.37** | **37.12** | **9.07** |
+  | Q4_K_M (official) | 4.79 GiB | 16.44 | 9.39 | 24.96 | 8.14 |
+  | IQ4_XS (community) | 4.29 GiB | 15.14 | 9.65 | 24.50 | 8.97 |
+  | Q4_1 (community) | 4.65 GiB | 12.90 | 8.56 | 21.54 | 7.66 |
+
+  `--repack 0` on the shipped file drops it to **11.48 pp / 7.49 tg**, so weight
+  repacking is worth 2× prefill and +37 % decode; Q4_0's repacked kernels
+  (`q4_0_8x8` NEON+dotprod) beat both the K-quants and the imatrix quants on this
+  CPU, and Q4_0 also uses ~330 MB less anonymous memory than Q4_K_M. A community
+  fine-tune that only ships IQ4_XS therefore starts with a 34 % prefill handicap.
+  Two consequences: `-fa on` is mandatory (`--flash-attn off` cannot create a
+  context with quantized KV: *failed to create context*), and `-b`/`-ub` are not
+  worth tuning (`-ub 1024` → 33.07 t/s vs 33.08 at the default).
 
 * **Two build experiments, both rejected by measurement** (llama-bench on
   LFM2-8B-A1B Q4_0, q8_0 KV, `-fa on`):
@@ -167,9 +235,10 @@ in it goes to the VLM; embeddings are always on.
 | `--threads` | **2** | one per A76; more threads contend for bandwidth and slow generation (pinned to A55: 8.8 tok/s vs 16.8) |
 | `--threads-batch` | **8** | prefill parallelises across all eight cores (+35–60 % pp) |
 | KV cache | **q8_0** (`--flash-attn on`) | half the KV footprint, negligible quality loss |
-| chat ctx | **12288** | +20 MB anon and no decode loss vs 8192 (measured); 8k prefill already costs ~5 min at 25 tok/s, so more would only buy room nobody waits for |
+| chat ctx | **16384** | 12288→16384 is +19 MB anon (4.8 MB per 1000 tokens, measured up to 40960) and zero pp/tg change while prompts are short; buys the room an agent client burns on tool schemas and results. The tradeoff is filling it: 5.7k tokens = 23.4 pp / 6.0 tg, 9.6k = 17.0 / 4.8, 14.3k = 13.7 / 3.8 |
 | embedding ctx | **4096** | mandatory model, always resident: keep its KV small |
-| tiny / VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation (and a VLM also pays ~1k tokens for one image); the 2k extra are cheap in RAM and only the first turn pays that prefill, later turns ride the prompt cache |
+| fast tier ctx | **8192** | LFM3-1.7B: 4k strangled a client that sends a system prompt plus a conversation; 8k is ~50 MB of KV and the first turn pays the prefill once |
+| VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation, and a VLM also pays ~1k tokens for one image; the 2k extra are cheap in RAM and later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
 | `--reasoning-budget` | **32** | measured sweet spot: clean `content`, 7/7 tool calling, 17.9 s/call |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 4.9 GB MoE stays reclaimable |
@@ -181,9 +250,10 @@ in it goes to the VLM; embeddings are always on.
 | model | weights (file) | `Anonymous` (KV + buffers) | ctx |
 | --- | --- | --- | --- |
 | Qwen3-Embedding-0.6B | 0.62 GB | 0.70 GB | 4096 |
-| Qwen3-0.6B | 0.62 GB | 1.00 GB | 6144 |
-| LFM2.5-8B-A1B | 4.85 GB (mmap) | **4.65 GB** | 12288 |
+| LFM3-1.7B | 1.05 GB | ~1.0 GB | 8192 |
+| LFM2.5-8B-A1B | 4.85 GB (mmap) | **4.67 GB** | 16384 |
 | LFM3-VL-2B + mmproj | 1.05 + 0.20 GB | 1.28 GB | 6144 |
+| Qwen3-0.6B (optional) | 0.62 GB | 1.00 GB | 6144 |
 
 `Anonymous` from `smaps_rollup` with all four loaded: 7.6 GB, `free` reports
 9.5 GB used and 2.4 GB available, no OOM, 64 °C. The ctx bump costs 59 KB/token on
@@ -193,9 +263,10 @@ new number: with a prompt above the window, the proxy's clamp reports
 `"context_tokens": 6144` for `cheap/router`, and `cheap/vision` reaches the board and
 is refused with `available context size (6144 tokens)` — nothing still assumes 4096.
 
-At 16k with four resident models the board needed ~12.5 GB and went into zram swap
-(5.7 GB swapped, 400 MB available) — the MoE then took 5 minutes to answer its
-health check. At the sizes above it fits with GBs of page cache to spare for the
+The earlier "16k → zram swap" incident was **not** the KV cache: it was the default
+`--parallel 4` compute buffers (~1 GB per model), which `--parallel 1` removed. With
+one slot the MoE's whole window costs 4.8 MB per 1000 tokens, so 16384 adds 19 MB
+over 12288 and the resident set above fits with GBs of page cache to spare for the
 cold VLM.
 
 ## Groups
@@ -211,8 +282,8 @@ had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
 
 The fast tier *is* kept warm even though it is evictable, because it answers the
 most frequent requests: the first `ciao` after a reboot spent **141 s** waiting
-for a cold 0.62 GB read from microSD, versus **1.1 s** with the weights in page
-cache.
+for a cold microSD read (measured on the 0.62 GB 0.6B it replaced; LFM3-1.7B is
+1.05 GB), versus **1.1 s** with the weights in page cache.
 
 **Warming is done by the router, not by llama-swap's `hooks.on_startup.preload`,
 and that hook is deliberately absent from `config.yaml`.** The hook is a synthetic
@@ -268,13 +339,13 @@ Tool turns are decided **before** everything else, including stickiness:
   started as `ciao` cannot stay on the 0.6B once a tool appears.
 
 An explicit model id is normally forwarded verbatim — that is how you debug one
-tier. The one exception is the tiny tier: a request addressed to `router-0.6b`,
-`fast` or `tiny` that carries `tools` (or a tool history) is answered by the
-`tools` route instead, and reports `X-Route-By: tools-on-tiny`. Tool orchestration
-lives on the MoE; the 0.6B *does* emit a call 7/7 but mangles the arguments, and
-its 6k context cannot hold a real schema block plus a conversation. `router` needs
-no guard — it is a routing alias already, so `tools` wins before the model is
-picked.
+tier. The one exception is the fast tier: a request addressed to `router`,
+`router-0.6b`, `fast` or `tiny` that carries `tools` (or a tool history) is
+answered by the `tools` route instead, and reports `X-Route-By: tools-on-tiny`.
+Tool orchestration lives on the MoE: LFM3-1.7B does emit calls (7/8 at Q4_0, 8/8 at
+Q8_0) but the MoE is 8/8 at the same 10.4 tok/s, and the 0.6B mangles the arguments.
+`router` as a *routing* id (`auto`, `router`, `orchestrator`) never reaches this
+check — `tools` wins before the model is picked.
 
 The tool payload is passed through verbatim (`tools`, `tool_choice`,
 `parallel_tool_calls`), no system prompt is injected (it would shift the cached
@@ -363,8 +434,9 @@ So, for every model that shadows a connection id (Workspace → Models, or
    of attached file content, and with every category off it emits no schema.
 2. `meta.capabilities` — `terminal`, `web_search`, `image_generation`,
    `code_interpreter`, `memory` false; `vision` true only on `cheap/vision`.
-3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 2 meta-tools, ~640
-   tokens, and the whole 126-tool gateway behind one search call. In Open WebUI
+3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 2 meta-tools
+   (`find_tool`, `run_tool`), ~640 tokens, and the whole 109-tool gateway behind
+   one lookup. In Open WebUI
    a global `inlet` filter injects that id into every chat, so `TOOL_IDS` there
    must equal the connection's `info.id`. That filter is also where the
    orchestration is consolidated: it *strips* every tool id for `cheap/router`
@@ -385,6 +457,100 @@ request in 990 tokens and routes through the orchestrator. `auto`, `router` and
 does not pin the 0.6B; `reasoner` and `vision` are the direct ids, useful for
 debugging only.
 
+### Which id to choose in the model picker
+
+`cheap/auto` — this is the one. It reaches the **router on :10000**, which
+inspects the request and forwards to the right llama-swap model: tools, images,
+code/translate/reason and the embedding-similarity tier are decided in Python,
+and the choice is pinned per session so a conversation does not bounce. Every
+other `cheap/*` id in the picker is a *direct* llama-swap model that bypasses
+that decision.
+
+| picker id | what it really is | when to use |
+|---|---|---|
+| `cheap/auto` | router, picks per request | always; it is the only id that can reach the tools tier |
+| `cheap/reasoner` | LFM2.5-8B-A1B, pinned | when you know you want the MoE and want to skip routing |
+| `cheap/vision` | LFM3-VL-2B | images, OCR |
+| `cheap/embedding-model` | Qwen3-Embedding-0.6B | never — it is an embedding model, not a chatbot |
+| `cheap/router` | LFM3-1.7B fast tier | **hidden** (`is_active 0`): the name collides with the router's own magic id `router`, which means "route this", so picking it looked like routing and instead pinned the fast tier |
+
+`auto`, `router` and `orchestrator` are the three ids the router itself treats as
+"decide for me"; `cheap/router` through LiteLLM arrived as the literal model id
+`router`, so the two meanings met in the same picker. Keeping the fast tier
+reachable as `fast` / `tiny` / `lfm3` (and the 0.6B as `router-0.6b`) while hiding
+`cheap/router` removes the ambiguity without losing either tier.
+
+### Why "search the web" used to hang (measured 26 Nov)
+
+Four faults stacked into one symptom — an answer that never arrives:
+
+1. **The meta-tools were named after the mechanism, not the effect.**
+   `tools_search` / `tool_call` read as "search" / "maybe call something", and the
+   MoE answered exactly that: it searched in round 1 *and* round 2 and then
+   stopped with nothing. Renamed to **`find_tool`** (returns schemas, runs
+   nothing) and **`run_tool`** (the only way to get real data); the descriptions
+   say that in those words and the `query` description asks for the *action*
+   ("search the web for X"), not the user's question. Same two tools, same ~640
+   prompt tokens. Old names still dispatch, so existing prompts keep working.
+2. **Ranking lost to verbose descriptions.** Cosine similarity over
+   `name + description` put `query-docs` above `web_search` for "search the web
+   for the latest news" (4/15 correct top-1 on a labelled set). Two server-side
+   changes — an intent-alias table (`search/web/news/latest/cerca/notizie → web_search`,
+   12 domains) worth 0.08, plus a light lexical top-up (0.05) — bring it to
+   **13/15 top-1**. This costs **zero prompt tokens**: it is ranking, not prompt.
+   Tunables: `MCP_LITE_ALIAS_WEIGHT`, `MCP_LITE_LEXICAL_WEIGHT`.
+3. **The synthesis turn was starved.** A tool turn is two jobs: emit the call
+   (budget 32 is measured 7/7) and write the answer from the tool result. At
+   budget 32 the second one returns `finish=stop` with an **empty** `content` in
+   6 s — the thought eats the budget and there is nothing left to say, which is
+   exactly what a client shows as a hang. The router now sends
+   `ROUTER_BUDGET_TOOLS_SYNTH=96` (the chat budget) when the last message is a
+   tool result.
+4. **A tool result is re-sent on every following turn.** 12 000 characters of web
+   markdown both overflow the 12k window (empty prompt) and cost seconds of
+   prefill per round. `ROUTER_TOOL_RESULT_MAX_CHARS=6000` trims head+tail with an
+   explicit marker, so the model knows text is missing.
+
+**The iteration cap is deliberately left at -1 (unlimited)** in Open WebUI.
+Capping it at 8 does terminate the bad loop, but it also kills the long agentic
+tasks this stack exists for: Open WebUI then answers "Tool-call limit reached (8
+iterations)". The loop has to end because the tools work, not because the client
+gives up. One chat row did measure 939 s with `content: ""` before these fixes —
+that row was the model re-searching, not the cap.
+
+`scripts/toolcheck.py` has an eighth case, **`synth`**, that replays a
+question + tool call + tool result and requires a non-empty answer with no
+further call: that is the regression test for faults 3 and 4.
+
+### The other half: the board is shared, and an abandoned request owns it
+
+`llama-swap` answers **429 `concurrency_limit`** instead of queueing, and
+`globalConcurrencyLimit` is 4. Behind that, each model runs with `--parallel 1`:
+one slot.
+
+The dangerous case is not load, it is an **abandoned request**. If the client goes
+away (stop button, its own timeout) or nobody reads the stream, `llama-server`
+keeps decoding to `max_tokens` and holds its only slot. One 4096-token request at
+4.4 tok/s blocks the reasoner for ~15 minutes, and every other caller — Open
+WebUI included — gets an instant 429 that it renders as a spinner.
+
+Measured during the investigation: 20 429s against 19 chat requests in ten
+minutes. Most of those 429s were **LiteLLM retrying 3×** for a single failed
+call, not a client polling. The other client was Home Assistant's Assist agent
+`conversation.soggiorno_llama_server_pc_openrouter` (the `llama_cpp`
+integration, `base_url` = LiteLLM, the same key Open WebUI uses) — a legitimate
+conversation agent that simply could not get a slot.
+
+Practical consequences, none of them inside the router:
+
+* a background or voice client sharing `cheap/auto` competes with chat for the
+  same slot: give it its own LiteLLM key with an `rpm/tpm` limit, or a different
+  model id, if it must not starve the interactive path;
+* keep `max_tokens` small on anything automated (the router floors tool turns at
+  800, but it never *lowers* a client's 4096);
+* `scripts/toolcheck.py` retries a 429 for up to 6×10 s, because a busy board
+  should not read as a tool-calling regression.
+
 Reasoning shows up as `reasoning_content`; Open WebUI renders it as the thinking
 block. At budget 32 it is short by design.
 
@@ -397,7 +563,7 @@ sudo ./install.sh --prune-models  # delete GGUFs that are not part of the stack
 sudo ./scripts/tune.sh --check    # show unapplied OS tuning
 sudo ./scripts/tune.sh --apply    # swappiness, noatime, governor, zram checks
 ./healthcheck.sh                  # quick liveness of both tiers
-./healthcheck.sh --tools          # + the 7-case tool-calling battery
+./healthcheck.sh --tools          # + the 8-case tool-calling battery
 ./scripts/toolcheck.py            # tool calling on its own (--quick, --stream, --model)
 ./benchmark.sh --all              # pp/tg per model, embedding latency
 sudo ./update-llama.cpp.sh        # rebuild llama.cpp at the tip of master (the timer runs it weekly)

@@ -4,7 +4,7 @@
 #   router (:10000) -> llama-swap (:10001) -> models
 #
 #   ./healthcheck.sh            # endpoints, models, embeddings, vision, services
-#   ./healthcheck.sh --tools    # also the 7-case tool-calling battery (~2 min)
+#   ./healthcheck.sh --tools    # also the 8-case tool-calling battery (~3 min)
 #
 set -uo pipefail
 
@@ -89,7 +89,7 @@ else
 fi
 
 if [ "${1:-}" = "--tools" ]; then
-    echo "tool calling (7 cases, via the router)"
+    echo "tool calling (8 cases, via the router)"
     if [ -x "${0%/*}/scripts/toolcheck.py" ]; then
         "${0%/*}/scripts/toolcheck.py" --url "${ROUTER}" || fail=1
     else
