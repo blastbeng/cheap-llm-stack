@@ -71,7 +71,19 @@ routing:
           members:
             - embedding-model
             - router
+        # The text workhorses swap with each other: the MoE (4.8 GB) and the
+        # quality tier (5.7 GB) do not fit together in 12 GB alongside the core
+        # pair (1.7 GB), and a persistent group can never be evicted, so the MoE
+        # lives here instead of in `core`. ttl: 0 keeps it loaded; only a
+        # deliberate request to `bolt` unloads it, and the next MoE request
+        # reloads it (~100 s cold, seconds when the page cache is still warm).
+        text:
+          swap: true
+          exclusive: false
+          persistent: false
+          members:
             - reasoner
+            - bolt
         # The VLM is one-at-a-time and loads on demand: its vision buffers are the
         # largest anonymous allocation after the MoE, and keeping it resident too
         # pushed this board into zram swap in an earlier iteration.
@@ -225,12 +237,55 @@ models:
       out: [text]
       tools: true
 
-  # No "big thinking" tier on purpose. A 4B dense model decodes at 2.9 tok/s here
-  # and a 2B at ~6 tok/s, so any request that reasons before answering costs 80-170 s
-  # no matter how the budget is set (measured: 4B + budget 256 = 170 s; 2B + budget 96
-  # still produced 500 tokens = 83 s). On a board nobody will sit and wait for, that
-  # is not a tier, it is a trap — and every use of it evicted the MoE. The MoE answers
-  # the same questions correctly in ~11 s, so it simply *is* the quality tier.
+  # ------------------------------------------------- quality tier (opt-in) ---
+  # NVIDIA-Nemotron-3.5-Bolt-E4B-4GB (gemma4 arch, 7.52 B params, Q4_K_M imatrix,
+  # 5.74 GiB, 64k trained context, vision mmproj available separately).
+  # Measured here, llama-bench, this board: pp512 8.07 t/s at -t 2 (13.15 at -t 8),
+  # tg32 2.91 t/s at -t 2 (2.70 at -t 8) — i.e. ~3.5x slower than the MoE, because
+  # it is dense per token: the "E4B" is about *embedding* params (per-layer input
+  # embeddings, 2560 d + 256 per layer over 42 blocks), not about sparse compute.
+  # Measured through llama-server, cold load 105 s:
+  #   * tool call, 3-tool surface, thinking off:   correct call in 21.7 s (19 tok)
+  #   * synthesis from a web_search result:        calls web_url_read instead of
+  #                                                answering (26.4 s) — same reflex
+  #                                                as the MoE, so the router's loop
+  #                                                guard handles both
+  #   * same turn with the tools withdrawn:        correct 167-token answer, 73.3 s
+  #   * thinking on (chat_template_kwargs.enable_thinking), budget 32 honoured:
+  #                                                64.6 s for 140 tok
+  #   * "chi è Gerry Scotti?" with no tool result: HALLUCINATES (journalist and
+  #                                                writer) — it must not answer
+  #                                                facts from memory
+  # So it is not a default: 5.74 GiB evicts the MoE and every answer costs 3x.
+  # It is a deliberate tier (`model: bolt|quality|deep`) for a hard question, with
+  # ttl 900 so it unloads itself, AND `auto` escalates to it: ROUTER_DEEP_TIER=1
+  # (set in llm-router.service) sends a long (>600 chars) reasoning request there
+  # on the first turn of a session and pins that session to it (`sticky-deep`).
+  # Measured through the router: 411.8 s for one 800-token deep answer, 265.1 s
+  # without tools, 290.5 s for the tool-result turn; the way back to the MoE is
+  # a ~100 s swap, so the pinning matters more than the escalation itself.
+  bolt:
+    name: "Nemotron-3.5-Bolt-E4B · quality, auto on long reasoning · 2.9 tok/s"
+    cmd: >
+      ${llama_bin}
+      -m ${models_dir}/Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf
+      --host 127.0.0.1 --port ${PORT}
+      ${thr_args}
+      --ctx-size 16384 ${kv_args}
+      ${gen_args}
+      --reasoning on --reasoning-budget 32
+      --alias bolt
+      --load-mode mmap
+    ttl: 900
+    aliases:
+      - quality
+      - deep
+      - nemotron
+    checkEndpoint: /health
+    capabilities:
+      in: [text]
+      out: [text]
+      tools: true
 
   # ------------------------------------------------------- vision (VLM) ---
   # LFM3-VL-2B: one model for descriptions, OCR, tables and screenshots.

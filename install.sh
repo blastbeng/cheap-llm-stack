@@ -17,6 +17,7 @@
 #   sudo ./install.sh --skip-build     # reuse the existing llama.cpp build
 #   sudo ./install.sh --tune           # also apply sysctl/IO/CPU tuning
 #   sudo ./install.sh --prune-models   # delete GGUFs that are not part of the stack
+#   sudo ./install.sh --with-quality   # also fetch the opt-in Nemotron quality tier
 #   sudo ./install.sh --dry-run        # print actions, change nothing
 #
 # Environment overrides:
@@ -50,6 +51,7 @@ SKIP_APT=0
 DO_TUNE=0
 DRY_RUN=0
 PRUNE_MODELS=0
+WITH_QUALITY=0
 for arg in "$@"; do
     case "${arg}" in
         --skip-build)   SKIP_BUILD=1 ;;
@@ -57,6 +59,7 @@ for arg in "$@"; do
         --no-apt)       SKIP_APT=1 ;;
         --tune)         DO_TUNE=1 ;;
         --prune-models) PRUNE_MODELS=1 ;;
+        --with-quality) WITH_QUALITY=1 ;;
         --dry-run)      DRY_RUN=1 ;;
         -h|--help)      sed -n '2,30p' "$0"; exit 0 ;;
         *) echo "unknown option: ${arg}" >&2; exit 2 ;;
@@ -227,6 +230,14 @@ REQUIRED_MODELS=(
     "LFM3-VL-2B-QAD-Q4_0.gguf"             # vision             (images / OCR)
     "mmproj-LFM3-VL-2B-Q8_0.gguf"          # vision projector
 )
+# Opt-in quality tier (5.74 GiB, 2.91 tok/s): fetched only with --with-quality, and
+# added to the prune whitelist only then.
+QUALITY_MODELS=(
+    "Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf"    # bolt / quality / deep
+)
+if [ "${WITH_QUALITY}" = 1 ]; then
+    REQUIRED_MODELS+=("${QUALITY_MODELS[@]}")
+fi
 
 if [ "${SKIP_MODELS}" = 0 ]; then
     log "Downloading models into ${MODELS_DIR} (long step, resumes if interrupted)..."
@@ -248,6 +259,13 @@ if [ "${SKIP_MODELS}" = 0 ]; then
     # in 24 s vs 113 s, at 1.25 GB instead of 2.4 GB.
     fetch "LiquidAI/LFM3-VL-2B-GGUF" "LFM3-VL-2B-QAD-Q4_0.gguf"
     fetch "LiquidAI/LFM3-VL-2B-GGUF" "mmproj-LFM3-VL-2B-Q8_0.gguf"
+
+    # opt-in quality tier: Nemotron-3.5-Bolt-E4B (gemma4, dense per token). Measured
+    # 2.91 tok/s and 5.74 GiB, so it swaps with the MoE instead of coexisting; it
+    # is not the default and `auto` does not reach it (ROUTER_DEEP_TIER=0).
+    if [ "${WITH_QUALITY}" = 1 ]; then
+        fetch "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB" "Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf"
+    fi
 else
     log "Skipping model downloads (--skip-models)"
 fi
