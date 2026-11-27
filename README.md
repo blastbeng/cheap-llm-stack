@@ -583,6 +583,11 @@ Five faults stacked into one symptom — an answer that never arrives:
    `tool_choice`** (named object *and* `"required"` — a named object measured
    2/5, worse than leaving it alone) and **ignores `response_format`
    json_schema** (0/5 produced JSON), so the budget is the only working lever.
+   The cost is paid on every chat too, because every `cheap/*` chat carries the
+   flat tool and therefore goes through the `tools` route: on the flat surface a
+   chitchat turn went 12.9 s (32) → 20.6 s (96) and "chi è Dante Alighieri" 10.3 s
+   → 12.2 s. That is the price of not answering a search from memory; the tool
+   call itself is 12–16 s either way.
 4. **A tool result is re-sent on every following turn, and its size is what the
    model thinks about.** The raw 1.5 kB `web_search` JSON (lanes, timings,
    engines) produced an empty answer at budgets 96–128 (0/3, 1/3); two or three
