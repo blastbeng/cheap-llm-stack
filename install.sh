@@ -226,7 +226,7 @@ REQUIRED_MODELS=(
     "Qwen3-Embedding-0.6B-Q8_0.gguf"       # embedding-model    (mandatory, always on)
     "LFM3-1.7B-QAD-Q4_0.gguf"              # router             (fast tier: chitchat / one-liners)
     "Qwen3-0.6B-Q8_0.gguf"                 # router-0.6b        (optional 1 s chitchat tier)
-    "LFM2.5-8B-A1B-Q4_0.gguf"              # reasoner           (default + tool calling)
+    "Moon-Beam-8B-A1B-IQ4_XS.gguf"         # reasoner           (default + tool calling)
     "LFM3-VL-2B-QAD-Q4_0.gguf"             # vision             (images / OCR)
     "mmproj-LFM3-VL-2B-Q8_0.gguf"          # vision projector
 )
@@ -251,9 +251,11 @@ if [ "${SKIP_MODELS}" = 0 ]; then
     fetch "LiquidAI/LFM3-1.7B-GGUF" "LFM3-1.7B-QAD-Q4_0.gguf"
     fetch "Qwen/Qwen3-0.6B-GGUF" "Qwen3-0.6B-Q8_0.gguf"
 
-    # text workhorse + tool calling: LFM2.5 MoE, 8.3B total / ~1.5B active per token.
-    # 7/7 on the tool battery at reasoning_budget_tokens=32 (LFM2-8B-A1B: 1/7).
-    fetch "LiquidAI/LFM2.5-8B-A1B-GGUF" "LFM2.5-8B-A1B-Q4_0.gguf"
+    # text workhorse + tool calling: Moon-Beam-8B-A1B, bailingmoe3 7.89B total /
+    # 1.3B active per token, IQ4_XS. 9/9 on the 9-case tool battery against 8/9 for
+    # LFM2.5-8B-A1B Q4_0, and faster end to end (7.6-11.3 s per call vs 16.6-18.3 s)
+    # because it thinks less. Same sparse shape, so the RAM envelope is unchanged.
+    fetch "tablinum/Moon-Beam-8B-A1B-GGUF" "Moon-Beam-8B-A1B-IQ4_XS.gguf"
 
     # single vision model: descriptions, OCR, tables. Same transcript as Qwen3-VL-2B
     # in 24 s vs 113 s, at 1.25 GB instead of 2.4 GB.

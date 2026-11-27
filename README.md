@@ -12,7 +12,7 @@ client ──► :10000  llm-router          content-aware orchestrator (Python,
               ▼
            :10001  llama-swap          model supervisor (Go, groups: core / heavy)
               ├── embedding-model       Qwen3-Embedding-0.6B  Q8_0   4k   CORE, always on
-              ├── reasoner              LFM2.5-8B-A1B  MoE Q4_0  16k   CORE, text + TOOLS
+              ├── reasoner              Moon-Beam-8B-A1B MoE IQ4_XS 16k  text + TOOLS
               ├── router                LFM3-1.7B     QAD-Q4_0   8k   CORE, chitchat / one-liners
               └── vision                LFM3-VL-2B    QAD-Q4_0   6k   heavy, images / OCR
 ```
@@ -31,7 +31,8 @@ pixel in it goes to the VLM; embeddings are always on.
   | model | file | tg (tok/s) | pp (tok/s) | note |
   | --- | --- | --- | --- | --- |
   | Qwen3-0.6B Q8_0 | 0.62 GB | **16.2** | 92 (`-t 2`) / 125 (`-t 8`) | optional 1 s tier |
-  | **LFM2.5-8B-A1B (MoE) Q4_0** | 4.85 GB | **11.6** | 22.6 (`-t 2`) / 34.8 (`-t 8`) | shipped, default + tools |
+  | **Moon-Beam-8B-A1B (MoE) IQ4_XS** | 5.00 GB | **8.4** | 20.3 (`-t 2`) / 30.8 (`-t 8`) | shipped, default + tools |
+  | LFM2.5-8B-A1B (MoE) Q4_0 | 4.85 GB | 10.4 | 23.2 (`-t 2`) / 37.3 (`-t 8`) | previous default, 8/9 tools |
   | **LFM3-1.7B QAD-Q4_0** | 1.05 GB | **10.1** | 41.4 (`-t 2`) / 62.9 (`-t 8`) | shipped, fast tier |
   | **LFM3-VL-2B QAD-Q4_0** | 1.05 GB | **8.1** | 33.1 (`-t 8`) | shipped, vision |
   | Qwen3.5-2B UD-Q4_K_XL | 1.24 GB | 6.3 | 34 (`-t 8`) | not shipped |
@@ -83,10 +84,10 @@ temperature 0.6, seeded tool battery; six fixed quality cases):
 
 | model | quant | file | t2 pp512 / tg64 | tools | verdict |
 | --- | --- | --- | --- | --- | --- |
-| **LFM2.5-8B-A1B** | Q4_0 | 4.50 GiB | 22.98 / 10.37 | **8/8** | baseline, still the best text+tools |
+| LFM2.5-8B-A1B | Q4_0 | 4.50 GiB | 22.98 / 10.37 | 8/8 | the default until the 9-case battery below: same flaws, twice the latency per call |
 | **LFM3-1.7B** | QAD-Q4_0 | 0.99 GiB | **41.44 / 10.13** | 7/8 | **shipped as the fast tier**: 1.8× prefill, same decode, 1/4.5 the RAM, 256K ctx |
 | LFM3-1.7B | Q8_0 | 1.85 GiB | 29.77 / 6.11 | 8/8 | 8/8 tools but 40 % less decode — Q4_0 wins |
-| Moon-Beam-8B-A1B (Ling-3.0-tiny + engram) | IQ4_XS | 4.49 GiB | 20.31 / 8.39 | 8/8 | good prose, but 20 % less decode and reasoning leaks into `content` |
+| **Moon-Beam-8B-A1B (Ling-3.0-tiny + engram)** | IQ4_XS | 4.49 GiB | 20.29 / 8.39 | **9/9** | **shipped**: fewer tokens of thought per call make it the fastest 8B in a loop (7.6-11.3 s vs 16.6-18.3 s) |
 | edge0-8b (Ling-3.0-tiny) | Q4_1 | 4.65 GiB | 12.90 / 8.56 | 8/8 | slowest prefill of the 8B class, same leak |
 | LFM2.5-8B-A1B-Uncensored | IQ4_XS | 4.29 GiB | 15.14 / 9.65 | 8/8 | works, but −34 % prefill and it answers Italian prompts in English |
 | LFM2.5-8B-A1B-Hermes-Abliterated | IQ3_XXS | 3.33 GB | bench stalls | — | unusable on this build |
@@ -94,11 +95,14 @@ temperature 0.6, seeded tool battery; six fixed quality cases):
 | EuroMoE-2.6B-A0.6B | Q4_K_M | 1.62 GB | — | — | `ggml-impl.h` fatal error: unsupported quant/arch |
 
 Tool numbers are not the whole story: all of these models are the same generation
-and share the same flaws (the shipped MoE also leaks a little thinking into
-`content` on extraction, and also got the 14:35+2h50 arithmetic wrong), but on the
-six quality cases the MoE is the only one that gets the Italian facts right *and*
-it has the fastest decode. That, plus 20–34 % less prefill for every IQ4_XS
-candidate, is why nothing replaced the workhorse.
+and share the same flaws — both MoEs leak a little thinking into `content` when
+the reasoning budget is smaller than the thought (measured: at budget 96 the
+Moon-Beam prompt "3 corridoi × 7 scaffali × 12 scatole − 47" answers **173**, at
+256 it answers **205**; the router already gives the answering turn 256). What
+separated them was not the bench but the battery: on the 9-case battery the
+Moon-Beam MoE scores 9/9 and per-call latency is set by how much the model
+thinks, not by tok/s — so it replaced the workhorse despite decoding 20 % slower
+and costing 57 MB more KV at double the context.
 
 * **The thinking budget is a real knob, not a formality.** `reasoning_budget_tokens`
   (per request, `--reasoning-budget` server-side) is what keeps LFM2.5 honest:
@@ -230,6 +234,45 @@ candidate, is why nothing replaced the workhorse.
   A76 has none, so it is off. `--ubatch-size` was swept too: 256 and 128 are
   slower than the default 512.
 
+### A/B/C/D pass, 27 Nov 2026: quant, grammar, context
+
+Everything here was measured with the board otherwise idle — one model at a time,
+`llama-swap` and the router stopped — because a bench that competes with a resident
+4.8 GB model measures swap, not the model. `llama-bench -fa on -ctk q8_0 -ctv q8_0
+-t 2,8 -p 512 -n 128 -r 2`, production serving flags (`--threads 2 --threads-batch 8
+--parallel 1`, reasoning on, budget 32), `scripts/toolcheck.py` 9-case battery at
+seed 1234 / temperature 0.6.
+
+| # | change | measured | verdict |
+| --- | --- | --- | --- |
+| A | LFM2.5-8B-A1B **Q5_K_M** (6.03 GB) instead of Q4_0 | pp 10.56/16.57, tg 6.74/6.83, 8/9, load 120 s, 33-37 s/call | **reject**: same score, half the speed, +1.1 GB |
+| B | `grammar` (GBNF) to constrain the tool call | `400 Cannot use custom grammar constraints with tools` | **not available** — and not needed, the template already constrains it |
+| B2 | `json_schema` + `tools` | accepted, but the call arrives as JSON in `content` (no `tool_calls`) | **reject**: it bypasses the channel a loop needs |
+| C | **Moon-Beam-8B-A1B IQ4_XS** | pp 20.29/30.79, tg 8.39/7.78, **9/9**, 7.6-11.3 s/call, load 91 s | **shipped** as the reasoner |
+| D | LFM3-1.7B QAD-Q4_0 | pp 41.46/62.53, tg 10.19/9.92, 7/9, load **22 s** | confirms the fast tier (5.9-12.6 s/call) |
+| ref | Nemotron-3.5-Bolt-E4B Q4_K_M | pp 8.50/14.18, tg 3.06/2.94, 9/9, 19-27 s/call, 98-116 s synthesis | confirms the deep tier: correct, 3x the wall clock |
+
+The `grammar` refusal is the interesting one: with `--jinja` on, llama.cpp installs a
+grammar for the tool call itself, so a second one is rejected outright. That is also
+why every battery failure is a *wrong choice* and never malformed JSON — the call
+channel is already constrained, so B was dropped rather than worked around.
+
+### Context: 16k is the ceiling, and time is what sets it
+
+Doubling the window costs **+57 MB** on this model (3.20 GB at 16k → 3.26 GB at 32k,
+q8_0 KV, GQA) and leaves the cold load at 91 s for both. Filling it is the cost:
+
+| prompt | model | prefill | wall clock for a 24-40 token answer |
+| --- | --- | --- | --- |
+| 5 497 tok | LFM2.5-8B-A1B Q4_0 | 21.6 tok/s (254 s) | 259 s |
+| 6 485 tok | Moon-Beam-8B-A1B | ≈14 tok/s (455 s) | 455 s |
+| 24 000 tok | Moon-Beam-8B-A1B | >900 s (the client gave up) | — |
+
+A long-context request is minutes of prefill whatever the window, so the lever is
+keeping the prompt small — the flat surface caps a tool result at 5×500 chars for
+exactly this reason — not paying RAM for a 32k window nothing can fill in reasonable
+time. 16384 stays.
+
 ### Quality tier, measured 27 Nov 2026: NVIDIA-Nemotron-3.5-Bolt-E4B-4GB
 
 The one candidate that is a different *kind* of model rather than another 8B-A1B
@@ -297,7 +340,7 @@ workhorse and the next MoE request pays the cold load again. So:
 | VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation, and a VLM also pays ~1k tokens for one image; the 2k extra are cheap in RAM and later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
 | `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis, 128 on the `deep` tier — 256 there is 88 s of thinking before the first word) |
-| load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 4.9 GB MoE stays reclaimable |
+| load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 5.0 GB MoE stays reclaimable |
 
 ### RAM, measured (this is what forced the sizes above)
 
@@ -307,7 +350,7 @@ workhorse and the next MoE request pays the cold load again. So:
 | --- | --- | --- | --- |
 | Qwen3-Embedding-0.6B | 0.62 GB | 0.70 GB | 4096 |
 | LFM3-1.7B | 1.05 GB | ~1.0 GB | 8192 |
-| LFM2.5-8B-A1B | 4.85 GB (mmap) | **4.67 GB** | 16384 |
+| Moon-Beam-8B-A1B | 5.00 GB (mmap) | **2.44 GB** (Rss 6.97 GB with the mapped weights) | 16384 |
 | LFM3-VL-2B + mmproj | 1.05 + 0.20 GB | 1.28 GB | 6144 |
 | Qwen3-0.6B (optional) | 0.62 GB | 1.00 GB | 6144 |
 
@@ -423,7 +466,8 @@ tier. The one exception is the fast tier: a request addressed to `router`,
 `router-0.6b`, `fast` or `tiny` that carries `tools` (or a tool history) is
 answered by the `tools` route instead, and reports `X-Route-By: tools-on-tiny`.
 Tool orchestration lives on the MoE: LFM3-1.7B does emit calls (7/8 at Q4_0, 8/8 at
-Q8_0) but the MoE is 8/8 at the same 10.4 tok/s, and the 0.6B mangles the arguments.
+Q8_0) but the MoE is 9/9 on the current 9-case battery, its per-call latency is the
+same (7.6-11.3 s against 5.9-12.6 s), and the 0.6B mangles the arguments.
 `router` as a *routing* id (`auto`, `router`, `orchestrator`) never reaches this
 check — `tools` wins before the model is picked.
 

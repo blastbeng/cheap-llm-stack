@@ -46,7 +46,7 @@ if [ "${DO_BENCH}" = 1 ]; then
         "Qwen3-Embedding-0.6B-Q8_0.gguf" \
         "LFM3-1.7B-QAD-Q4_0.gguf" \
         "Qwen3-0.6B-Q8_0.gguf" \
-        "LFM2.5-8B-A1B-Q4_0.gguf" \
+        "Moon-Beam-8B-A1B-IQ4_XS.gguf" \
         "LFM3-VL-2B-QAD-Q4_0.gguf"
     do
         [ -s "${MODELS}/${gguf}" ] || { log "skip ${gguf} (not downloaded)"; continue; }

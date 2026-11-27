@@ -198,24 +198,37 @@ models:
       tools: true
 
   # ------------------------------------------- text workhorse + agent (MoE) ---
-  # LFM2.5-8B-A1B: 8.3B total / ~1.5B active. Decodes at ~10.4 tok/s (dense 2B: 6.3,
-  # dense 4B: 2.9) and won the blind-graded quality battery, so it is the default for
-  # every non-trivial text request.
-  # --reasoning-budget 32 is the measured sweet spot for tool calling: 7/7 in 17.9 s
-  # per call, versus 7/7 in 24.1 s at 96 and 5/7 at 0 (where the thinking spills into
-  # `content`). The router also raises temperature to 0.6 on tool turns: a cold
-  # sampler answers a tool request in prose instead of emitting the call (0.2 scored
-  # 5/7 whatever the budget, 0.6 scored 7/7). The router overrides the rest per
-  # request (route `reason` gets 256) and
-  # keeps it bounded for plain chat so `content` never carries the monologue.
-  # ttl 0: this model must never be evicted — a cold load costs ~100 s of microSD and
+  # tablinum/Moon-Beam-8B-A1B-IQ4_XS (bailingmoe3, 7.89B total / 1.3B active,
+  # 4.49 GiB): same sparse shape as the LFM2.5-8B-A1B it replaces, so the RAM
+  # envelope of this tier does not move.
+  # Measured on this board, llama-bench, production KV (q8_0/q8_0) + flash-attn,
+  # one model resident and nothing else running:
+  #   pp512  20.29 t/s at -t 2 / 30.79 at -t 8   (LFM2.5 Q4_0: 23.19 / 37.25)
+  #   tg128   8.39 t/s at -t 2 /  7.78 at -t 8   (LFM2.5 Q4_0: 10.43 /  9.13)
+  #   cold load 91 s (LFM2.5: 88 s), RSS 3.2 GB at 16k ctx and 3.26 GB at 32k —
+  #   +57 MB for double the context, because the KV is GQA and q8_0.
+  # The 9-case tool battery (scripts/toolcheck.py, seed 1234, temperature 0.6,
+  # budget 32): 9/9 here, 8/9 for LFM2.5-8B-A1B Q4_0, 7/9 for LFM3-1.7B, 9/9 for
+  # bolt at 3x the latency. Fewer tokens of thought per call also make it faster
+  # end to end than the model with the higher bench: 7.6-11.3 s per tool call
+  # against 16.6-18.3 s, which is what actually matters in a 4-hop loop.
+  # The other half of the same test was a quant swap on the old model: LFM2.5
+  # Q5_K_M (6.03 GB) scored the same 8/9 at half the speed (pp 10.56/16.57,
+  # tg 6.74/6.83, 33-37 s per call, 120 s load) — a bigger quant is not a quality
+  # upgrade on this board, it is just more bytes to read per token.
+  # --reasoning-budget 32 stays: it is what the call turn needs (~90 tokens of
+  # thought), and the answering turn is already raised to 256 by the router
+  # (TOOLS_SYNTH_BUDGET). Measured on this model with the same arithmetic prompt:
+  # budget 96 answers 173 for 3*7*12-47 (wrong, 4.6 s), budget 256 answers 205
+  # (right, 11.5 s) — the synth budget is not cosmetic.
+  # ttl 0: this model must never be evicted — a cold load costs ~91 s of microSD and
   # an eviction also throws away the tool-schema prompt cache. (An earlier `ttl: 1800`
   # silently unloaded it in the middle of the night.)
   reasoner:
-    name: "LFM2.5-8B-A1B (MoE) · text + tools · 10.4 tok/s"
+    name: "Moon-Beam-8B-A1B (MoE) · text + tools · 8.4 tok/s"
     cmd: >
       ${llama_bin}
-      -m ${models_dir}/LFM2.5-8B-A1B-Q4_0.gguf
+      -m ${models_dir}/Moon-Beam-8B-A1B-IQ4_XS.gguf
       --host 127.0.0.1 --port ${PORT}
       ${thr_args}
       --ctx-size 16384 ${kv_args}
