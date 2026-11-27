@@ -28,6 +28,9 @@ Usage:
   scripts/toolcheck.py --url http://127.0.0.1:10001 --model reasoner --budget 96
                                               # the same case straight at the MoE: the way
                                               # to tell a router bug from a sampling draw
+  scripts/toolcheck.py --grammar-file /tmp/toolcall.gbnf
+                                              # same battery with constrained decoding on
+                                              # every request (the grammar lever)
 
 Sampling is seeded by default: the MoE is a 1.5B-active model at temperature 0.2 and
 one case of seven flips between runs (the Telegram case did, once, in production),
@@ -223,7 +226,15 @@ def main() -> int:
     ap.add_argument("--budget", type=int, default=None,
                     help="reasoning_budget_tokens to send (default: the router's)")
     ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--grammar-file", metavar="FILE",
+                    help="GBNF file to send as `grammar` on every request (constrained "
+                         "decoding: what the router would have to do on tool turns)")
     args = ap.parse_args()
+
+    grammar = None
+    if args.grammar_file:
+        with open(args.grammar_file) as fh:
+            grammar = fh.read()
 
     endpoint = args.url.rstrip("/") + "/v1/chat/completions"
     cases = [c for c in CASES if not args.quick or c[0] in QUICK]
@@ -244,6 +255,8 @@ def main() -> int:
                    "temperature": args.temperature, "max_tokens": 400}
         if args.budget is not None:
             payload["reasoning_budget_tokens"] = args.budget
+        if grammar:
+            payload["grammar"] = grammar
         if args.seed:
             payload["seed"] = args.seed
         if args.stream:
