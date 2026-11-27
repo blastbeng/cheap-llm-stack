@@ -422,9 +422,10 @@ of them bit us:
 * **Raising `--ctx-size` does not fix schemas.** Measured prefill on this board is
   21–35 tok/s, so a 7.6k prompt costs 4–6 minutes *per request*. More context only
   buys room for the schemas to fill. It was still worth going 4096 → 6144 on the
-  tiny/VLM tiers (see Measured settings), because once the surface is down to two
-  tools the *fixed* part of the prompt is ~1k and the cache makes later turns
-  nearly free — the extra room then goes to the conversation, which is the point.
+  tiny/VLM tiers (see Measured settings), because once the surface is down to
+  7 tools the *fixed* part of the prompt is 1.3k (0.7k with the two meta-tools
+  alone) and the cache makes later turns nearly free — the extra room then goes
+  to the conversation, which is the point.
 
 So, for every model that shadows a connection id (Workspace → Models, or
 `POST /api/v1/models/create` with `base_model_id: null` and the connection id as
@@ -438,83 +439,129 @@ So, for every model that shadows a connection id (Workspace → Models, or
    of attached file content, and with every category off it emits no schema.
 2. `meta.capabilities` — `terminal`, `web_search`, `image_generation`,
    `code_interpreter`, `memory` false; `vision` true only on `cheap/vision`.
-3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 2 meta-tools
-   (`find_tool`, `run_tool`), ~640 tokens, and the whole 109-tool gateway behind
-   one lookup. In Open WebUI
-   a global `inlet` filter injects that id into every chat, so `TOOL_IDS` there
-   must equal the connection's `info.id`. That filter is also where the
-   orchestration is consolidated: it *strips* every tool id for `cheap/router`
-   (the tiny tier never gets one, not even when picked by hand) and only
-   auto-injects on `cheap/auto`, `cheap/reasoner` and the non-cheap models;
-   `cheap/vision` can still opt in manually for the image+tools turn.
-   **The cheap models get `mcp-cheap-flat` instead** — see the next section.
+3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 7 tools, 4,421
+   characters of schema — five flat everyday tools (`web_search`,
+   `web_url_read`, `send_message`, `read_image`, `chroma_query_documents`) plus
+   the two meta-tools (`find_tool`, `run_tool`) that keep the whole 109-tool
+   gateway reachable. In Open WebUI a global `inlet` filter injects that id into
+   every chat, so `TOOL_IDS` there must equal the connection's `info.id`. That
+   filter is also where the orchestration is consolidated: it *strips* every
+   tool id for `cheap/router` (the tiny tier never gets one, not even when
+   picked by hand) and leaves `cheap/vision` to opt in manually for the
+   image+tools turn. See the next section for why a MoE needs the flat five and
+   a large model does not.
 4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
    over the prompt, and compaction cannot fit a 6k model anyway.
 
-### One flat tool for the cheap models (`mcp-cheap-flat`)
+### One surface, five flat tools (`mcp-tools-lite`)
 
-The two-meta-tool surface is a good trade for a large model: ~640 tokens buy 109
-tools. It is a **bad** trade for the 8B-A1B MoE, because it turns one job into
-two decisions and the second one keeps failing:
+The meta-tool surface is a good trade for a large model: 678 prompt tokens buy
+109 tools. It is a **bad** trade for the 8B-A1B MoE, because it turns one job
+into two decisions and the second one keeps failing:
 
 * `find_tool` → schema, then `run_tool` with the arguments: the model has to
   carry an opaque payload across a turn. Measured on the same 6-case web
-  battery: **meta-tools 0/6, flat tool 6/6** — the failures were not bad
+  battery: **meta-tools 0/6, one flat tool 6/6** — the failures were not bad
   arguments, they were `find_tool` in round 1, `find_tool` again in round 2,
   `finish=stop` with nothing.
+* `find_tool("Gerry Scotti")` ranks `ask` (the model council) above
+  `web_search` and answers **14,027 characters** at k=3 (2,967 at k=1): the
+  lookup that was supposed to save tokens is the largest prompt in the chat.
+  The full `find_tool → run_tool → answer` chain is **1/3 usable** (LOOP, LOOP,
+  empty answer), even with `k=1`.
 * `run_tool` also hides the real schema, so the arguments arrive as prose
-  (`{"name": "web_search", "arguments": "query=..."}`) instead of a parsed call.
+  (`{"name": "web_search", "arguments": "query=..."}`) instead of a parsed
+  call.
 
-So the cheap models get a second, **separate** instance of tools-lite that
-advertises one ordinary function, `web_search`, with a curated schema (`query`,
-`count`) and no meta-tools at all:
+So the same proxy advertises the everyday tools **flat, next to** the
+meta-tools: one connection, one surface, nothing else to keep in sync.
+`tools/list` answers 7 tools / 4,421 characters of schema / **1,287 prompt
+tokens**, against 678 for the two meta-tools alone and 71 for none.
+
+| flat tool | why it is in the set | schema |
+|---|---|---|
+| `web_search` | the original failure; curated `query` + `count` | 682 chars |
+| `web_url_read` | the second step of a search (`url` + `maxLength`) | 445 |
+| `send_message` | Telegram notify; `text` only, the chat is fixed | 331 |
+| `read_image` | one path in, ImageContent out | 321 |
+| `chroma_query_documents` | "what did we decide before?"; `query` only | 412 |
+
+`web_search` and the other hand-written specs are in `proxy.py`; anything named
+in `MCP_LITE_FLAT_TOOLS` without one gets a compact schema generated from the
+catalogue (`_compact_spec`: name, description trimmed to 200 chars, parameters
+with type/enum/default). Three details are not cosmetic:
+
+* **The upstream schema invites invented arguments.** `send_message` has a
+  `chatId` override and the MoE filled it with `"blast"` in 3/3 runs, which
+  would override the configured chat; the flat schema does not offer the field.
+  Same for `freshness`/`site` on `web_search` — invented as `freshness:"day"`,
+  `site:"italiano"`, which then filters the answer away.
+* **`chroma_query_documents` needs a collection name, and a model cannot guess
+  one** (0/3 on "cerca nella memoria del progetto" with the generated schema).
+  The flat schema takes `query` and the proxy fills in
+  `MCP_LITE_MEMORY_COLLECTION` (`aiderdesk_cheap-llm-stack_memory`).
+* **Results are rendered, not dumped.** `web_search` answers
+  `title / url / snippet` per result plus `(N more results not shown)`;
+  `chroma_query_documents` answers `- note` lines. Raw JSON (lanes, timings,
+  ids, distances, `null` arrays) is what the synthesis turn copies instead of
+  the content, and it is re-sent on every following turn (see fault 4).
+
+Enabled per deployment, so the proxy stays generic:
 
 ```yaml
-  mcp-tools-lite-flat:            # identical image/code, different surface
-    image: python:3.12-alpine
-    ports: ["8815:8815"]
-    mem_limit: 192m
+  mcp-tools-lite:
+    ports: ["8814:8814"]         # one container, one index cache
     environment:
-      MCP_LITE_PORT: "8815"
-      MCP_LITE_FLAT_TOOLS: "web_search"
-      MCP_LITE_META_TOOLS: "0"    # no find_tool/run_tool next to it
+      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,send_message,read_image,chroma_query_documents"
+      MCP_LITE_MEMORY_COLLECTION: "aiderdesk_cheap-llm-stack_memory"
       MCP_LITE_FLAT_MAX_RESULTS: "3"
       MCP_LITE_FLAT_SNIPPET: "220"
-    volumes: ["./tools-lite:/app:ro", "./tools-lite/cache-flat:/cache:rw"]
 ```
 
-It is the same `proxy.py` (the MCP stack lives in `/opt/docker/compose/mcp` on
-the media host, not in this repository); the flat surface is opt-in by env, so
-the existing `mcp-tools-lite` on :8814 is untouched, and the new container is
-started with `up -d --no-deps` so nothing else is recreated. The flat reply is rendered for a small
-model rather than dumped: **`title` / `url` / snippet** per result plus
-`(N more results not shown)` — **945 characters** instead of the 1.5 kB JSON,
-which matters twice, because that text comes back in the synthesis prompt (see
-fault 4 below). Seeding `cache-flat/index.json` from `cache/index.json` skips
-the ~100 s semantic index build on the board.
+With `MCP_LITE_FLAT_TOOLS` empty the surface is the old two meta-tools, so any
+other client of :8814 is unaffected. The proxy logs the surface once per change
+(`surface: 7 tools, 4421 chars of schema (...)`).
 
-In Open WebUI this is a second MCP connection, `mcp-cheap-flat`
-(`http://host.docker.internal:8815/mcp`, same bearer), and the global `inlet`
-filter (v0.4.0) chooses per model:
+Measured on the production sentence ("Cerca sul web chi è Gerry Scotti e dimmi
+chi è in due frasi"), streaming, seeds 5/15/25, three everyday asks:
+
+```
+web       -> web_search             {"query":"Gerry Scotti","count":3}   3/3
+telegram  -> send_message           {"text":"Testi completati."}         3/3
+memory    -> chroma_query_documents {"query":"router","n_results":3}     3/3
+```
+
+The call turn is 13–22 s (the first one pays the prefill) and the whole chain —
+call → real `tools/call` → answer — returns an Italian answer in ~40–50 s at
+the synthesis budget, 60 s for the slowest seed. Without the flat tools the same
+three asks produce `find_tool`, prose, or `web_search` on the memory question:
+**0/3, 0/3, 0/3**.
+
+In Open WebUI this is one connection (`mcp-tools-lite`, same bearer) and one id
+in the filter (v0.4.2) for every model, `cheap/*` included — a model never sees
+two surfaces, and their sum costs twice the prompt and confuses the choice:
 
 ```python
-TOOL_IDS       = ["server:mcp:mcp-tools-lite"]   # every non-cheap model
-FLAT_TOOL_IDS  = ["server:mcp:mcp-cheap-flat"]   # cheap/* only
-wanted = FLAT_TOOL_IDS if model_id.startswith("cheap/") else TOOL_IDS
+TOOL_IDS      = ["server:mcp:mcp-tools-lite"]
+DROP_TOOL_IDS = ("server:mcp:mcp-cheap-flat",)   # removed server: stale chats clean themselves
 ```
 
-`cheap/router` still gets **no** tools at all. The important property is the one
-that makes this safe: nothing outside `cheap/*` changes — a cloud model
-(`anthropic/claude-sonnet-4.5`, `openai/gpt-5`, …) keeps exactly the tool ids it
-had, and a stale flat id is removed from its list if it is ever there.
+`cheap/router` still gets **no** tools at all. Nothing outside the connection
+changes — a cloud model (`anthropic/claude-sonnet-4.5`, `openai/gpt-5`, …) keeps
+exactly the tool ids it had and drives the same 7-tool surface through
+`find_tool` / `run_tool` as before.
+
+A second container (`mcp-tools-lite-flat` on :8815, one flat tool, no
+meta-tools) existed for a day while this was measured; it is gone, with its
+cache copy, because two containers meant two 109-tool indexes (192 MB each),
+two connections to keep aligned and two surfaces that could drift.
 
 Measured with this profile: `cheap/router` carries **50 prompt tokens** and no
-tools at all, `cheap/reasoner` carries **819** with the two meta-tools, 15.7 s
-first-turn prefill and **0.3 s on the following turn** — with a constant 2-tool
-surface the chat prefix stays byte-identical, llama.cpp reuses its cache and only
-the new message is prefilled. That cache hit is the real payoff of a small tool
-surface, more than the tokens themselves. `cheap/auto` answers the same shape of
-request in 990 tokens and routes through the orchestrator. `auto`, `router` and
+tools at all; the MoE carries 1,287 on the first turn and **0.3 s on the
+following turn** — with a constant surface the chat prefix stays byte-identical,
+llama.cpp reuses its cache and only the new message is prefilled. That cache
+hit is the real payoff of a small tool surface, more than the tokens
+themselves. `cheap/auto` routes through the orchestrator. `auto`, `router` and
 `orchestrator` are the magic ids that mean "route this" — `router` included, it
 does not pin the 0.6B; `reasoner` and `vision` are the direct ids, useful for
 debugging only.
@@ -555,8 +602,9 @@ Five faults stacked into one symptom — an answer that never arrives:
    ("search the web for X"), not the user's question. Same two tools, same ~640
    prompt tokens. Old names still dispatch, so existing prompts keep working.
    This was necessary but **not sufficient**: the indirection itself is beyond
-   the MoE, so the cheap models now get a flat `web_search` instead (0/6 →
-   **6/6**, see the `mcp-cheap-flat` section).
+   the MoE, so the same surface now advertises five flat everyday tools next to
+   the meta-tools (0/6 → **6/6**, see the "One surface, five flat tools"
+   section).
 2. **Ranking lost to verbose descriptions.** Cosine similarity over
    `name + description` put `query-docs` above `web_search` for "search the web
    for the latest news" (4/15 correct top-1 on a labelled set). Two server-side
