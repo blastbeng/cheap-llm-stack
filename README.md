@@ -173,12 +173,14 @@ candidate, is why nothing replaced the workhorse.
   is a 6–10 minute prefill, which is why tool results are capped at 6000 chars
   upstream. The model itself was trained for 128k.
 
-* **There is no thinking tier, and that is a measurement.** A 4B dense model
-  decodes at 3.0 tok/s here, a 2B at ~6: with `--reasoning-budget 256` the 4B
+* **A thinking tier cannot be the default, and that is a measurement.** A 4B dense
+  model decodes at 3.0 tok/s here, a 2B at ~6: with `--reasoning-budget 256` the 4B
   spent **170 s** on one definition question, and the 2B with a 96-token budget
   still ran to 500 tokens = **83 s**. Nothing interactive fits in that, and every
   use of the 4B evicted the MoE, which then took **121 s** to come back from
-  microSD. The MoE answers the same questions correctly in ~11 s.
+  microSD. The MoE answers the same questions correctly in ~11 s. The one exception
+  is the narrow `deep` escalation (long *and* reasoning, measured at 265–412 s):
+  see the quality-tier section.
 
 * **Speculative decoding does not pay here.** Measured on the 8B MoE with its
   328M DSpark drafter: 10.2 tok/s → 3.36–5.64 (verification is bandwidth-bound on
@@ -228,6 +230,60 @@ candidate, is why nothing replaced the workhorse.
   A76 has none, so it is off. `--ubatch-size` was swept too: 256 and 128 are
   slower than the default 512.
 
+### Quality tier, measured 27 Nov 2026: NVIDIA-Nemotron-3.5-Bolt-E4B-4GB
+
+The one candidate that is a different *kind* of model rather than another 8B-A1B
+merge: `gemma4` architecture (this build knows it — `gemma4` is in `libllama`),
+7.52 B params, 42 blocks, 64k trained context, Q4_K_M built from an imatrix,
+5.74 GiB, plus a 0.99 GiB vision mmproj if wanted. The "E4B" in the name is about
+*embedding* parameters (per-layer input embeddings, 2560 d + 256 per layer), not
+sparse compute: per token it is dense.
+
+| measurement | Nemotron-3.5-Bolt-E4B | LFM2.5-8B-A1B (shipped) |
+| --- | --- | --- |
+| file / quant | 5.74 GiB Q4_K_M | 4.50 GiB Q4_0 (repacked) |
+| llama-bench t2 pp512 / tg32 | 8.07 / **2.91** | 22.98 / **10.37** |
+| llama-bench t8 pp512 / tg32 | 13.15 / 2.70 | 35.0 / 9.8 |
+| cold load | 105 s | ~100 s |
+| tool call (3-tool surface, think off) | correct call, 21.7 s for 19 tok | 7/7 battery at ~18 s |
+| `scripts/toolcheck.py` subset (tg/web/none/synth) | **4/4** (20.8 s web, 28.5 s none, 60 s synth) | 9/9 |
+| synthesis from a `web_search` result | calls `web_url_read` instead of answering (26.4 s) | same reflex — the loop guard is what ends it for both |
+| the same turn with `tools` withdrawn | correct 167-token answer, 73.3 s | correct, 30-50 s |
+| thinking on, `reasoning_budget_tokens: 32` | honoured, 64.6 s for 140 tok | 96 / 256 depending on route |
+| "chi è Gerry Scotti?" with no tool result | **hallucinates** (journalist and writer) | also wrong on facts it does not have |
+
+Verdict: **opt-in weights, automatic routing.** It is not better at the thing that
+was broken (it takes the same "read one more page" step), it is 3.5× slower, and at
+5.74 GiB its weights cannot coexist with the MoE in 12 GB — loading it evicts the
+workhorse and the next MoE request pays the cold load again. So:
+
+* it lives in a `text` swap group **with** the MoE (`swap: true`, not persistent;
+  `core` keeps only embedding + fast tier so `bolt` cannot evict those),
+  `ttl: 900` so it unloads itself;
+* it is reachable deliberately as well: `model: bolt` (aliases `quality`, `deep`,
+  `nemotron`, so `cheap/bolt` in LiteLLM works through the wildcard);
+* **`auto` escalates to it.** `ROUTER_DEEP_TIER=1` (set in the unit) turns the
+  `deep` route on. A request is deep when it is long (>600 chars or >40 words)
+  **and** uses reasoning vocabulary, judged on the first turn of a session; that
+  session is then pinned to `bolt` (`sticky-deep`), so the tool results coming back
+  are read by the model that asked for them and a follow-up does not pay the
+  ~100 s reload. The route also sends a 128-token thinking budget — a 256-token
+  thought at 2.91 tok/s is 88 s before the first word. Measured end to end through
+  the router:
+
+  | case | route (why) | wall clock |
+  | --- | --- | --- |
+  | long M/M/1 design question + the 7-tool MCP surface | `deep` (`deep-first-turn`), 800 tok | **411.8 s** |
+  | the same question with no tools | `deep` (`reasoning-deep`), 400 tok | **265.1 s** |
+  | tool result inside that session | `deep` (`sticky-deep`), 800 tok | **290.5 s** |
+  | new short question, new session | `tools` → `reasoner`, 111 tok | 109.8 s (the reload) |
+  | `scripts/toolcheck.py`, full battery, `model: auto` | 9/9, every case `tools`/`reasoner` | 19–83 s/case |
+
+  The last two rows are the price: one deep answer is 4–7 minutes, and getting back
+  to the MoE costs a swap when the session ends. Ordinary tool traffic is untouched
+  — the battery still scores 9/9 through `auto`, and a short tool question is still
+  ~24 s.
+
 ## Measured settings
 
 | knob | value | why |
@@ -240,7 +296,7 @@ candidate, is why nothing replaced the workhorse.
 | fast tier ctx | **8192** | LFM3-1.7B: 4k strangled a client that sends a system prompt plus a conversation; 8k is ~50 MB of KV and the first turn pays the prefill once |
 | VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation, and a VLM also pays ~1k tokens for one image; the 2k extra are cheap in RAM and later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
-| `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis) |
+| `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis, 128 on the `deep` tier — 256 there is 88 s of thinking before the first word) |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 4.9 GB MoE stays reclaimable |
 
 ### RAM, measured (this is what forced the sizes above)
@@ -273,8 +329,17 @@ cold VLM.
 
 | group | swap | members | effect |
 | --- | --- | --- | --- |
-| `core` | no, `persistent` | embedding-model, router, reasoner | always loaded, never evicted (~6.5 GB anon) |
+| `core` | no, `persistent` | embedding-model, router | always loaded, never evicted (~1.7 GB anon) |
+| `text` | yes | reasoner, bolt | one at a time: the MoE (4.8 GB) and the quality tier (5.7 GiB) do not fit together |
 | `heavy` | yes | vision | loads on demand, `ttl: 900` |
+
+The MoE sits in `text` rather than in `core` because `persistent` groups can never
+be evicted: with it in `core`, a `bolt` request could not load at all (6.6 + 5.7
+GB against 12). `ttl: 0` still keeps it loaded; only a `bolt` request unloads it —
+explicit, or the `deep` route escalating a long reasoning turn — and the next MoE
+request reloads it (~100 s cold, seconds while the page cache is warm). Measured
+after a `bolt` turn: `reasoner ready`,
+`embedding-model ready`, `router ready`, 3.7 GB available.
 
 The VLM is *not* resident: with embedding + 0.6B + VLM + MoE loaded the board once
 had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
@@ -321,11 +386,12 @@ throws away the prompt cache that makes agent traffic affordable. (An earlier
 
 Response headers `X-Route`, `X-Route-Model`, `X-Route-By`, `X-Route-Ms`,
 `X-Route-Budget` show what was chosen and why (`client`, `sticky`, **`tools`**,
-`image`, `image+ocr-hint`, `chitchat`, `code`, `reasoning`, `trivial`,
+`image`, `image+ocr-hint`, **`deep-first-turn`**, **`reasoning-deep`**,
+**`sticky-deep`**, `chitchat`, `code`, `reasoning`, `trivial`,
 `translate-short`, `semantic(0.71/0.09)`, `semantic-fast-rejected`, `default`).
 
 Routes: `fast` → router, `assistant`/`reason`/**`tools`** → reasoner,
-`vision`/`vision-docs` → vision, `embedding` → embedding-model.
+`vision`/`vision-docs` → vision, **`deep` → bolt**, `embedding` → embedding-model.
 
 ### Tool-calling routing
 
@@ -337,6 +403,20 @@ Tool turns are decided **before** everything else, including stickiness:
   hitting the model that issued the call);
 * the session's sticky entry is re-pinned to `tools`, so a conversation that
   started as `ciao` cannot stay on the 0.6B once a tool appears.
+
+Two rules sit in front of that branch, and both exist because Open WebUI attaches
+the flat tool surface to *every* request, so "has tools" stopped meaning "is an
+agent turn":
+
+* **images win over tools.** LFM3-VL handles tools (6/7 on the battery) and neither
+  text model can see the picture, so a turn carrying an image goes to
+  `vision`/`vision-docs` even with tools in the body. Before this rule the router
+  sent every image to the MoE, blind: measured, `image+tools` now answers the text
+  in the picture in 43.1 s on `by=image`.
+* **the first turn of a deep session wins over tools.** Long (>600 chars or >40
+  words) *and* reasoning vocabulary *and* no tool history → `deep` on `bolt`, and
+  the session is pinned there (`sticky-deep`) so the tool results that come back
+  are read by the model that asked for them. See the quality-tier section.
 
 An explicit model id is normally forwarded verbatim — that is how you debug one
 tier. The one exception is the fast tier: a request addressed to `router`,
@@ -447,9 +527,10 @@ So, for every model that shadows a connection id (Workspace → Models, or
    every chat, so `TOOL_IDS` there must equal the connection's `info.id`. That
    filter is also where the orchestration is consolidated: it *strips* every
    tool id for `cheap/router` (the tiny tier never gets one, not even when
-   picked by hand) and leaves `cheap/vision` to opt in manually for the
-   image+tools turn. See the next section for why a MoE needs the flat five and
-   a large model does not.
+   picked by hand). The image+tools turn no longer needs opting in: the router
+   sends any turn carrying an image to the vision tier, which handles tools
+   itself. See the next section for why a MoE needs the flat five and a large
+   model does not.
 4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
    over the prompt, and compaction cannot fit a 6k model anyway.
 
@@ -570,14 +651,14 @@ debugging only.
 
 `cheap/auto` — this is the one. It reaches the **router on :10000**, which
 inspects the request and forwards to the right llama-swap model: tools, images,
-code/translate/reason and the embedding-similarity tier are decided in Python,
-and the choice is pinned per session so a conversation does not bounce. Every
-other `cheap/*` id in the picker is a *direct* llama-swap model that bypasses
-that decision.
+code/translate/reason, long reasoning (the `deep` tier on `bolt`) and the
+embedding-similarity tier are decided in Python, and the choice is pinned per
+session so a conversation does not bounce. Every other `cheap/*` id in the picker
+is a *direct* llama-swap model that bypasses that decision.
 
 | picker id | what it really is | when to use |
 |---|---|---|
-| `cheap/auto` | router, picks per request | always; it is the only id that can reach the tools tier |
+| `cheap/auto` | router, picks per request | always; it is the only id that can reach the tools *and* `deep` tiers |
 | `cheap/reasoner` | LFM2.5-8B-A1B, pinned | when you know you want the MoE and want to skip routing |
 | `cheap/vision` | LFM3-VL-2B | images, OCR |
 | `cheap/embedding-model` | Qwen3-Embedding-0.6B | never — it is an embedding model, not a chatbot |
@@ -651,6 +732,47 @@ Five faults stacked into one symptom — an answer that never arrives:
    (both spellings, plus `<|im_end|>`) to every reasoner request: free, and it
    never fires on a well-formed turn.
 
+6. **The page was navigation, not an article.** `web_url_read` (mcp-searxng
+   behind the gateway) converts HTML to markdown but keeps the chrome: on
+   `it.wikipedia.org/wiki/Gerry_Scotti` the first 2 000 characters are
+   `[Vai al contenuto] / Menu principale / Navigazione / Ricerca / Aspetto`.
+   A model that asked for 2 000 characters therefore read *menus*, concluded it
+   needed the other language edition, read more menus, and on the fourth turn
+   spent its whole 256-token thinking budget planning a third fetch:
+   `content: ""`, `usage: {"incomplete": true}`, three turns of 54.6 / 58.4 /
+   23.8 s (Open WebUI chat `1f7d4872`, 27 Nov). The fix is in the flat tool, not
+   in the model: it now asks the gateway for a 60 000-character window, keeps the
+   article (`_readable`: start at the first block that is not a menu label, a link
+   farm or a short non-sentence; drop those blocks everywhere else), flattens
+   inline links to their label (`[Gerry Scotti](https://…)` → `Gerry Scotti`,
+   which on a Wikipedia article is more than half the bytes) and only then
+   truncates to the size the caller asked for. Measured: 40 000 chars of page →
+   **15 449 of article**, and the first 2 000 now start at "Virginio Scotti,
+   detto Gerry …". `section` / `readHeadings` / `paragraphRange` still pass
+   through untouched, because those slices are already filtered upstream.
+   The same change makes search results usable on their own (**4 × 300 chars**
+   instead of 3 × 220, 1 200 chars total, under the router's 1 500 cap): the first
+   snippet for an Italian query is now real prose from the article.
+
+**A turn that already carries three tool results answers with them.**
+`ROUTER_TOOL_LOOP_MAX_RESULTS` (default **3**, `0` disables) strips `tools`,
+`tool_choice` and `parallel_tool_calls` from the request before it is forwarded,
+so the only thing the model can produce is the answer. Removing the tools is what
+terminates the loop — a bigger thinking budget buys another 30-60 s of planning
+(measured with the tools still in the body: budget 96 / 160 / 256 → 0/2 answers;
+without them: 2/2). The guard also forces the 256-token synthesis budget, even
+though `awaiting_tool_answer()` would normally infer it from the last message.
+
+Measured end to end through the real 7-tool surface (`e2e`: router → llama-swap →
+MoE, tools executed on `mcp-tools-lite`):
+
+| scenario | before | after |
+| --- | --- | --- |
+| "chi è Gerry Scotti? cerca sul web" | 3 turns, 55 s each, empty answer | search 13.1 s → read article 41.6 s → **answer, 99.4 s total** |
+| same, second page tried first | `content: ""`, `incomplete` | 2 hops, answer |
+| "confronta le due Wikipedia, leggi entrambe" | loop until the budget dies | 3 results → `loop guard: 3 tool results already`, answer (234 s, 800-token answer) |
+| `scripts/toolcheck.py` 9-case battery | 9/9 | **9/9** (20-27 s per case, `synthweb` 83 s) |
+
 **The iteration cap is deliberately left at -1 (unlimited)** in Open WebUI.
 Capping it at 8 does terminate the bad loop, but it also kills the long agentic
 tasks this stack exists for: Open WebUI then answers "Tool-call limit reached (8
@@ -702,6 +824,7 @@ block. At budget 32 it is short by design.
 sudo ./install.sh                 # build + models + units  (--skip-build, --skip-models, --dry-run)
 sudo ./install.sh --tune          # same, plus OS tuning
 sudo ./install.sh --prune-models  # delete GGUFs that are not part of the stack
+sudo ./install.sh --with-quality  # also fetch the opt-in Nemotron tier (5.74 GiB)
 sudo ./scripts/tune.sh --check    # show unapplied OS tuning
 sudo ./scripts/tune.sh --apply    # swappiness, noatime, governor, zram checks
 ./healthcheck.sh                  # quick liveness of both tiers
