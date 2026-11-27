@@ -44,9 +44,13 @@ came out equal on accuracy and ~2x faster on the MoE, with better Italian gramma
 so the MoE is both the default and the quality tier.
 
 Every route is sticky per session (X-Session-Id header, else a hash of the first
-user message, else client IP+UA) for STICKY_TTL seconds. Stickiness matters: a
-model swap costs 1-40 s depending on page-cache state, so a conversation must not
-bounce between models.
+user message, else client IP+UA) for STICKY_TTL seconds, and the decision is made
+once, at the front of the loop: after a tool call has been issued the session keeps
+the model that issued it (`sticky-loop`), because a swap is the most expensive
+thing this router can do — 88-120 s of cold load on the 8B tiers, plus the prompt
+cache holding the tool-schema block. A switch happens only when it is unavoidable:
+an image turn for a model with no vision, or the first tool turn of a session that
+started on another route.
 
 Response headers: X-Route, X-Route-Model, X-Route-By, X-Route-Ms, X-Route-Budget.
 
@@ -187,8 +191,9 @@ ROUTE_MODEL = {
 }
 
 # The fast tier and every alias that resolves to it. A tool turn addressed to one of
-# these is redirected to the tools route (see Handler.do_POST): the MoE scores 8/8
-# there at 10.4 tok/s and LFM3-1.7B scores 7/8, so tools stay on the MoE.
+# these is redirected to the tools route (see Handler.do_POST): the MoE scores 9/9
+# on the 9-case battery and LFM3-1.7B 7/9, and per-call latency is within 2 s of each
+# other (7.6-11.3 s vs 5.9-12.6 s), so the MoE's accuracy is what decides.
 TINY_MODELS = {"router", "router-0.6b", "fast", "tiny", "tiny-0.6b", "lfm3"}
 
 # --------------------------------------------------------------- prototypes ---
@@ -868,6 +873,21 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
                 and not has_image(msgs)):
             sticky_put(key, "deep")
             return "deep", "deep-first-turn"
+        # A loop that has already issued a call is not re-homed. The decision is
+        # made once, at the front of the loop; after that a switch is the most
+        # expensive thing this router can do. Measured on this board: a cold load
+        # is 88-120 s per model (22 s only for the 1 GB fast tier), and switching
+        # also throws away the prompt cache that holds the tool-schema block, so
+        # the next turn re-reads ~1.5 k tokens at ~20 tok/s (~75 s) instead of the
+        # 4-6 s a warm continuation costs. The model that wrote the call is the one
+        # that has to read its result back.
+        if sticky and has_tool_history(msgs):
+            return sticky, "sticky-loop"
+        if sticky and sticky != "tools":
+            # First tool turn of a session that started elsewhere: this switch is
+            # paid once per session, and it is the last one (sticky-loop holds).
+            log("switching session %s: %s -> tools (one cold load, ~90 s, and the "
+                "prompt cache is lost)" % (key[:12], sticky))
         sticky_put(key, "tools")
         return "tools", "tools"
 
@@ -1021,8 +1041,8 @@ class Handler(BaseHTTPRequestHandler):
             if requested and requested.lower() not in ("auto", "router", "orchestrator"):
                 # A concrete id is forwarded verbatim (that is how a client debugs one
                 # tier), with one exception: a tool request must never land on the fast
-                # tier. LFM3-1.7B does emit calls (7/8 at Q4_0, 8/8 at Q8_0) but the 8B
-                # MoE is 8/8 at the same 10.4 tok/s, and the 0.6B mangles arguments.
+                # tier. LFM3-1.7B does emit calls (7/9 at Q4_0) but the 8B MoE is
+                # 9/9 at the same per-call latency, and the 0.6B mangles arguments.
                 # Tool orchestration lives on the MoE, so this is not a downgrade.
                 if requested.lower() in TINY_MODELS and (
                     has_tools(body) or has_tool_history(body.get("messages") or [])
