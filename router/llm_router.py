@@ -117,6 +117,9 @@ ROUTE_BUDGET = {
     "tools": int(os.environ.get("ROUTER_BUDGET_TOOLS", "96")),
     "vision": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
     "vision-docs": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
+    # Only used from the `deep` route: at 2.9 tok/s a 256-token thought is 88 s
+    # before the first word of the answer.
+    "deep": int(os.environ.get("ROUTER_BUDGET_DEEP", "128")),
 }
 # A tool call is ~120 tokens of reasoning + ~60 of arguments; a client that caps the
 # answer at 200 tokens truncates the call instead of the prose, which the agent then
@@ -146,6 +149,24 @@ TOOL_RESULT_MAX_CHARS = int(os.environ.get("ROUTER_TOOL_RESULT_MAX_CHARS", "1500
 # Below this the MoE answers a tool request in prose instead of emitting the call.
 # Measured, see apply_route_knobs. 0 disables the floor.
 TOOLS_MIN_TEMPERATURE = float(os.environ.get("ROUTER_TOOLS_MIN_TEMPERATURE", "0.6"))
+# Loop guard. An 8B model on a slow host can keep asking for "one more page":
+# measured on Open WebUI chat 1f7d4872 (web_search -> web_url_read EN -> IT,
+# 55 s per turn) it never stopped because every result was page chrome, and the
+# fourth turn spent its whole 256-token thinking budget planning another fetch
+# and returned no content at all (empty answer, usage.incomplete). After this
+# many tool results the turn is a synthesis turn whether the model agrees or
+# not: `tools` is removed from the body, so the only way to answer is to answer.
+# 0 disables the guard.
+TOOL_LOOP_MAX_RESULTS = int(os.environ.get("ROUTER_TOOL_LOOP_MAX_RESULTS", "3"))
+# The quality tier (llama-swap model `bolt`, Nemotron-3.5-Bolt-E4B) is reached by
+# `auto` when a request is plainly a deep one: long *and* asking for reasoning, on
+# the first turn of a session, which is then pinned there (sticky-deep) so a
+# follow-up does not pay the ~100 s reload back to the MoE. Measured on this board:
+# 2.91 tok/s against the MoE's 10.4, 5.74 GiB of weights, 412 s for one 800-token
+# answer -- which is why the escalation is deliberately narrow and off until the
+# unit sets ROUTER_DEEP_TIER=1.
+DEEP_ENABLED = os.environ.get("ROUTER_DEEP_TIER", "0") == "1"
+DEEP_MIN_CHARS = int(os.environ.get("ROUTER_DEEP_MIN_CHARS", "600"))
 CONTEXT_LENGTH = int(os.environ.get("ROUTER_CONTEXT_LENGTH", "12288"))
 
 DEFAULT_ROUTE = "assistant"
@@ -161,6 +182,7 @@ ROUTE_MODEL = {
     "tools": "reasoner",
     "vision": "vision",
     "vision-docs": "vision",
+    "deep": "bolt",
     "embedding": "embedding-model",
 }
 
@@ -669,6 +691,32 @@ def awaiting_tool_answer(messages: list[dict]) -> bool:
     return False
 
 
+def tool_result_count(messages: list[dict]) -> int:
+    """How many tool answers this turn already carries.
+
+    Three shapes reach this router: `role: tool` (Open WebUI chat completions),
+    `role: function` (legacy) and a Responses-style user message carrying
+    `function_call_output` items. All of them mean "a tool has already run".
+    """
+    total = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("tool", "function"):
+            total += 1
+            continue
+        content = m.get("content")
+        if isinstance(content, list):
+            for chunk in content:
+                if not isinstance(chunk, dict):
+                    continue
+                kind = str(chunk.get("type", ""))
+                if kind.startswith("tool") or kind == "function_call_output":
+                    total += 1
+    return total
+
+
 def cap_tool_results(messages: list[dict], limit: int = TOOL_RESULT_MAX_CHARS) -> int:
     """Trim `role: tool` payloads in place; returns how many were cut.
 
@@ -706,7 +754,20 @@ def cap_tool_results(messages: list[dict], limit: int = TOOL_RESULT_MAX_CHARS) -
 def apply_route_knobs(body: dict, route: str) -> dict:
     """Per-route sampling knobs: thinking budget, a token floor, a temperature floor."""
     msgs = body.get("messages") or []
-    if route == "tools" and awaiting_tool_answer(msgs):
+    guarded = False
+    if route in ("tools", "deep") and body.get("tools") and TOOL_LOOP_MAX_RESULTS > 0:
+        used = tool_result_count(msgs)
+        if used >= TOOL_LOOP_MAX_RESULTS:
+            # Enough evidence: answer with it. Removing the tools is what makes
+            # the turn terminate — a bigger thinking budget only buys another
+            # 30-60 s of planning another fetch (measured: budget 96/160/256 with
+            # the tools still there, 0/2 answers; without them, 2/2).
+            body.pop("tools", None)
+            for key in ("tool_choice", "parallel_tool_calls", "functions", "function_call"):
+                body.pop(key, None)
+            guarded = True
+            log("loop guard: %d tool results already, tools withdrawn for this turn" % used)
+    if route == "tools" and (guarded or awaiting_tool_answer(msgs)):
         # Budget is only injected when the client has not chosen one, same rule as
         # every other route.
         if "reasoning_budget_tokens" not in body and "thinking_budget_tokens" not in body:
@@ -715,7 +776,7 @@ def apply_route_knobs(body: dict, route: str) -> dict:
         budget = ROUTE_BUDGET.get(route)
         if budget is not None:
             body["reasoning_budget_tokens"] = budget
-    if route == "tools":
+    if route == "tools" or (route == "deep" and body.get("tools")):
         # A cold sampler (0.2, the usual client default) collapses this model onto the
         # prose continuation instead of the tool-call branch: measured on the 7-case
         # battery at seed 1234, temperature 0.2 scored 5/7 identically on budgets
@@ -751,22 +812,65 @@ def session_key(headers, body: dict, client_ip: str) -> str:
     return "h:" + hashlib.sha1(seed.encode()).hexdigest()[:16]
 
 
+def looks_deep(text: str) -> bool:
+    """A request worth 3.5x the latency: long *and* asking for reasoning.
+
+    Short prompts are never escalated, however technical they look: at 2.91 tok/s
+    the quality tier costs 40 s before the first word, and a one-liner does not
+    need it. The thresholds match the `deep` rule in _decide_cold.
+    """
+    if not DEEP_ENABLED or not text:
+        return False
+    if not (REASON_RE.search(text) or TECH_RE.search(text)):
+        return False
+    return len(text) > DEEP_MIN_CHARS or len(text.split()) > 40
+
+
 def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
     """Return (route, reason)."""
     msgs = body.get("messages") or []
     text = message_text(msgs)
     key = session_key(headers, body, client_ip)
 
-    # 0. agent turns win over everything, including stickiness: a conversation that
-    #    started as chitchat and now carries tools must not stay on the 0.6B, and a
-    #    tool loop must keep hitting the model that issued the call (it is the model
-    #    that has to interpret its own tool results, and the one whose prompt cache
-    #    holds the tool schema block).
+    # A session that already went deep stays there. Switching back to the MoE
+    # re-reads 4.8 GB from storage and throws away the quality tier's prompt
+    # cache, and a follow-up ("ok, e il caso n=3?") is the same job as the turn
+    # before it.
+    sticky = sticky_get(key)
+    if sticky == "deep" and DEEP_ENABLED:
+        return "deep", "sticky-deep"
+
+    # 0a. an image turn goes to the vision tier even when the client attached
+    #     tools: LFM3-VL handles tools (6/7 on the battery), while neither text
+    #     model can see the picture at all -- before this branch Open WebUI's
+    #     global tool injection sent every image to the MoE, blind. A session
+    #     that already ran tools stays where it is: the model that issued the
+    #     call is the one that has to read the result back.
+    if has_image(msgs) and not has_tool_history(msgs):
+        route, reason = _decide_cold(msgs, text, body)
+        sticky_put(key, route)
+        return route, reason
+
+    # 0b. agent turns win over everything else, including stickiness: a conversation
+    #    that started as chitchat and now carries tools must not stay on the 0.6B,
+    #    and a tool loop must keep hitting the model that issued the call (it is the
+    #    model that has to interpret its own tool results, and the one whose prompt
+    #    cache holds the tool schema block).
     if has_tools(body) or has_tool_history(msgs):
+        # ...except the FIRST turn of a session that is plainly a deep reasoning
+        # request: Open WebUI attaches the flat tool surface to every request, so
+        # without this branch `auto` would never reach the quality tier at all.
+        # Only on the first turn: once the session is pinned, the branch above
+        # keeps every further turn (tool results included) on the same model.
+        # An image request stays on the vision tier: `bolt` has no vision, and
+        # the deep rule would otherwise swallow the picture.
+        if (sticky is None and looks_deep(text) and not has_tool_history(msgs)
+                and not has_image(msgs)):
+            sticky_put(key, "deep")
+            return "deep", "deep-first-turn"
         sticky_put(key, "tools")
         return "tools", "tools"
 
-    sticky = sticky_get(key)
     if sticky:
         return sticky, "sticky"
 
@@ -797,6 +901,8 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
     # protocollo TCP e perché il three-way handshake è necessario, con un esempio
     # concreto di connessione." is 24 words / 145 chars and fell through to the
     # default route, where the chat budget cut its thought and leaked it into content.
+    if DEEP_ENABLED and REASON_RE.search(text) and (words > 40 or len(text) > DEEP_MIN_CHARS):
+        return "deep", "reasoning-deep"
     if REASON_RE.search(text) and (words > 18 or len(text) > 160):
         return "reason", "reasoning"
 
@@ -877,6 +983,8 @@ class Handler(BaseHTTPRequestHandler):
                     "routes": ROUTE_MODEL, "budgets": ROUTE_BUDGET,
                     "tools_synth_budget": TOOLS_SYNTH_BUDGET,
                     "tool_result_max_chars": TOOL_RESULT_MAX_CHARS,
+                    "tool_loop_max_results": TOOL_LOOP_MAX_RESULTS,
+                    "deep_tier": DEEP_ENABLED,
                     "context_length": CONTEXT_LENGTH,
                     "prototypes_ready": PROTO.ready.is_set()}
             if not upstream_ok("/health"):

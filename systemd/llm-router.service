@@ -17,6 +17,16 @@ Environment=PYTHONUNBUFFERED=1
 # Advertised window. Must match the `reasoner` --ctx-size in config.yaml: this is
 # what /v1/models and /health report, and what agent clients budget against.
 Environment=ROUTER_CONTEXT_LENGTH=16384
+# Loop guard: after 3 tool results a turn answers with what it has (tools are
+# withdrawn from the request). 0 disables it.
+Environment=ROUTER_TOOL_LOOP_MAX_RESULTS=3
+# Quality tier escalation from `auto`: ON. A request that asks for reasoning and is
+# longer than ROUTER_DEEP_MIN_CHARS (600) chars or 40 words goes to Nemotron-3.5-Bolt
+# for its whole session, including the turns that carry tool results; everything else
+# stays on the MoE. The cost is explicit: 2.91 tok/s instead of 10.4 and ~100 s of
+# reload the first time either model has to come back.
+Environment=ROUTER_DEEP_TIER=1
+Environment=ROUTER_DEEP_MIN_CHARS=600
 ExecStart=/usr/bin/python3 /opt/cheap-llm-stack/router/llm_router.py
 Restart=always
 RestartSec=3
