@@ -56,8 +56,8 @@ pixel in it goes to the VLM; embeddings are always on.
 
   | model | score | per call | verdict |
   | --- | --- | --- | --- |
-  | **LFM2.5-8B-A1B, `reasoning_budget_tokens=32`** | **7/7** | 17.9 s | shipped: `reasoner` |
-  | LFM2.5-8B-A1B, budget 96 | 7/7 | 24.1 s | same score, 35 % slower |
+  | LFM2.5-8B-A1B, `reasoning_budget_tokens=32` | 7/7 | 17.9 s | short battery prompts only — starves the real Open WebUI one, see below |
+  | **LFM2.5-8B-A1B, budget 96** | **7/7** | 24.1 s | shipped for tool turns: same score, +35 % here, but the only reliable value once the prompt carries a system message |
   | LFM2.5-8B-A1B, budget 0 | 5/7 | 52 s | thinking leaks into `content` → unusable |
   | Qwen3-0.6B Q8 | 7/7 | 14–21 s | mangles arguments, poor prose |
   | LFM2.5-1.2B-Instruct Q8 | 6/7 | 28 s | refuses `save_memory` |
@@ -240,7 +240,7 @@ candidate, is why nothing replaced the workhorse.
 | fast tier ctx | **8192** | LFM3-1.7B: 4k strangled a client that sends a system prompt plus a conversation; 8k is ~50 MB of KV and the first turn pays the prefill once |
 | VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation, and a VLM also pays ~1k tokens for one image; the 2k extra are cheap in RAM and later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
-| `--reasoning-budget` | **32** | measured sweet spot: clean `content`, 7/7 tool calling, 17.9 s/call |
+| `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis) |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 4.9 GB MoE stays reclaimable |
 
 ### RAM, measured (this is what forced the sizes above)
@@ -351,8 +351,8 @@ The tool payload is passed through verbatim (`tools`, `tool_choice`,
 `parallel_tool_calls`), no system prompt is injected (it would shift the cached
 prefix), the answer ceiling is raised to at least 800 tokens so a client's
 `max_tokens: 200` cannot truncate the call instead of the prose, and **temperature
-is raised to 0.6** (see below). The thinking budget is 32 when the model has to
-*emit* a call and **256** when the last message is a tool result and it has to
+is raised to 0.6** (see below). The thinking budget is **96** when the model has
+to *emit* a call and **256** when the last message is a tool result and it has to
 *write the answer* (`ROUTER_BUDGET_TOOLS_SYNTH`); the end-of-turn markers are
 appended to `stop` so the GGUF's literal `</|end_of_sentence|>` cannot leak into
 the answer. A client that tries to switch thinking *off*
@@ -544,7 +544,7 @@ reachable as `fast` / `tiny` / `lfm3` (and the 0.6B as `router-0.6b`) while hidi
 
 ### Why "search the web" used to hang (measured 26 Nov)
 
-Six faults stacked into one symptom — an answer that never arrives:
+Five faults stacked into one symptom — an answer that never arrives:
 
 1. **The meta-tools were named after the mechanism, not the effect.**
    `tools_search` / `tool_call` read as "search" / "maybe call something", and the
@@ -564,15 +564,25 @@ Six faults stacked into one symptom — an answer that never arrives:
    12 domains) worth 0.08, plus a light lexical top-up (0.05) — bring it to
    **13/15 top-1**. This costs **zero prompt tokens**: it is ranking, not prompt.
    Tunables: `MCP_LITE_ALIAS_WEIGHT`, `MCP_LITE_LEXICAL_WEIGHT`.
-3. **The synthesis turn was starved.** A tool turn is two jobs: emit the call
-   (budget 32 is measured 7/7) and write the answer from the tool result. At
-   budget 32 the second one returns `finish=stop` with an **empty** `content` in
-   6 s — the thought eats the budget and there is nothing left to say, which is
-   exactly what a client shows as a hang. Measured on a replayed synthesis turn
-   with the real `web_search` payload, 3 runs per point: `32 → 0/3`,
-   `96 → 0/3`, `192 → 2/3`, `256 → 3/3` (33 s), `384 → 3/3` (54 s). The router
-   therefore sends `ROUTER_BUDGET_TOOLS_SYNTH=256` when the last message is a
-   tool result, and 32 when it has to emit the call — the asymmetry *is* the fix.
+3. **Both turns were starved, and the call turn worst of all.** A tool turn is
+   two jobs: emit the call and write the answer from the tool result. On the
+   call turn, 32 tokens looked right on the short battery prompts, but on the
+   real Open WebUI request (MCP instructions as a system message + "cerca sul
+   web chi è Gerry Scotti e dimmi chi è in due frasi") the budget runs out
+   *while the model is planning the call* and the leftover thought lands in
+   `content` — `"The user asks in Italian: Search the web who is…"`, no
+   `tool_calls`, and then a confident answer from memory (and a wrong one: it
+   invented a singing career). Measured on the flat surface, streaming, seeds
+   15/25/47/55/65: `32 → 3/5` calls, `64 → 1/5`, **`96 → 5/5` (12–14 s)**, `128 → 5/5`.
+   On the answer turn the same starvation returns an **empty** `content` in 6 s
+   (`32 → 0/3`, `96 → 0/3`, `192 → 2/3`, **`256 → 3/3`**, `384 → 3/3` at 54 s),
+   which is exactly what a client shows as a hang. The router therefore sends
+   **96** to emit a call and `ROUTER_BUDGET_TOOLS_SYNTH=256` to write the
+   answer; the asymmetry *is* the fix.
+   Note on the obvious alternatives: this llama.cpp build **ignores
+   `tool_choice`** (named object *and* `"required"` — a named object measured
+   2/5, worse than leaving it alone) and **ignores `response_format`
+   json_schema** (0/5 produced JSON), so the budget is the only working lever.
 4. **A tool result is re-sent on every following turn, and its size is what the
    model thinks about.** The raw 1.5 kB `web_search` JSON (lanes, timings,
    engines) produced an empty answer at budgets 96–128 (0/3, 1/3); two or three
@@ -581,18 +591,7 @@ Six faults stacked into one symptom — an answer that never arrives:
    marker so the model knows text is missing and can re-query. Above ~1500 the
    JSON also costs seconds of prefill per round, and 12 000 characters of web
    markdown overflow the window outright.
-5. **Search intents were answered from memory.** Even with the trigger words in
-   the flat tool description, the MoE answered "chi è Gerry Scotti" from its own
-   weights in 1 of 5 runs — and invented a singing career. So the router pins
-   `tool_choice` to the actual function (`{"type":"function","function":{"name":
-   "…_web_search"}}`) when the *last user message* carries a search verb
-   (`cerca`, `cercami`, `search`, `google`, `look up`) and the request carries
-   such a tool. Named, not `"required"`: measured on this build, `"required"` is
-   treated as `auto` (one 82 s prose answer, no call), while the named object is
-   2/2 at 5–8 s. It fires only on the call turn (a tool result in the history
-   means the answer is being written), leaves a client's own `tool_choice`
-   alone, and `ROUTER_FORCE_SEARCH=0` disables it.
-6. **The end-of-turn marker leaked as text.** The GGUF carries
+5. **The end-of-turn marker leaked as text.** The GGUF carries
    `</|end_of_sentence|>` as ordinary text pieces, so a degenerate turn *writes*
    it into the answer — that is the `…dimmi chi è</｜end▁of▁sentence>` row Open
    WebUI stored on 26 Nov. The router now appends the model's own stop markers
@@ -610,7 +609,7 @@ that row was the model re-searching, not the cap.
 result) and **`synthweb`** (a 1.5 kB `web_search` payload, the production
 shape): each replays a question + tool call + tool result and requires a
 non-empty answer with no further call. Those are the regression tests for
-faults 3, 4 and 6.
+faults 3, 4 and 5.
 
 ### The other half: the board is shared, and an abandoned request owns it
 

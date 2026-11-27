@@ -101,14 +101,20 @@ MAX_STICKY = 1024
 #       reasoning_content, the rest dumped in content). At 96 the same prompt is clean
 #       and often *faster* (26.0 s vs 32.1 s on a Rust/Go comparison) because the
 #       model stops re-thinking; typical chat prompts cost 0-3 s more.
-#   32  for tool turns, where it is measured 7/7 at 17-19 s: a tool decision needs no
-#       plan, and every extra thinking token is a second the user waits.
+#   96  for the tool-call turn as well. 32 looked right on the short battery prompts
+#       (7/7 at 17-19 s) but starves the real Open WebUI request: with the MCP
+#       instructions as a system message plus "cerca sul web chi è Gerry Scotti e
+#       dimmi chi è in due frasi", 32 cuts the thought *while it is planning the
+#       call* and dumps "The user asks in Italian: Search the web who is…" into
+#       content — no tool_calls at all. Measured on the flat surface, streaming,
+#       seeds 15/25/47/55/65: 32 -> 3/5 calls, 64 -> 1/5, 96 -> 5/5 (12-14 s),
+#       128 -> 5/5 (12-16 s). The call needs ~90 tokens of thought, not 32.
 #   256 for the rare "prove it / design it" request, which is the only place a long
 #       thinking pass pays for itself at 10 tok/s
 ROUTE_BUDGET = {
     "assistant": int(os.environ.get("ROUTER_BUDGET_CHAT", "96")),
     "reason": int(os.environ.get("ROUTER_BUDGET_REASON", "256")),
-    "tools": int(os.environ.get("ROUTER_BUDGET_TOOLS", "32")),
+    "tools": int(os.environ.get("ROUTER_BUDGET_TOOLS", "96")),
     "vision": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
     "vision-docs": int(os.environ.get("ROUTER_BUDGET_VISION", "32")),
 }
@@ -697,59 +703,6 @@ def cap_tool_results(messages: list[dict], limit: int = TOOL_RESULT_MAX_CHARS) -
     return cut
 
 
-# "Cerca sul web X" is the one request where an answer from memory is always
-# wrong, and the MoE sometimes gives one: even with the trigger words written into
-# the flat tool description it answered from memory (and invented a career) in 1 of
-# 5 runs on the production sentence "cerca sul web chi è Gerry Scotti". A client
-# cannot be asked to pin `tool_choice`, so the router does it when the *last* user
-# message carries a search verb and the request carries a `web_search` tool. Only
-# verbs: "ricerca" is also a noun ("spiega la ricerca scientifica") and must not
-# trigger it. ROUTER_FORCE_SEARCH=0 disables it.
-FORCE_SEARCH = os.environ.get("ROUTER_FORCE_SEARCH", "1") != "0"
-SEARCH_RE = re.compile(r"\b(cerca|cercami|cercalo|cercala|cercate|cercare|"
-                       r"search|google|look\s*up|lookup)\b", re.I)
-
-
-def last_user_text(messages: list[dict]) -> str:
-    for m in reversed(messages):
-        if not isinstance(m, dict) or m.get("role") != "user":
-            continue
-        c = m.get("content")
-        if isinstance(c, str):
-            return c
-        if isinstance(c, list):
-            return "\n".join(chunk.get("text", "") for chunk in c
-                             if isinstance(chunk, dict) and chunk.get("type") == "text")
-    return ""
-
-
-def force_search_call(body: dict) -> dict:
-    """Pin the web_search call when the user explicitly asked to search the web.
-
-    Only on the call turn: a tool result in the history means this turn writes the
-    answer, and forcing another search there would loop. A client that pinned its
-    own tool_choice is left alone.
-    """
-    if not FORCE_SEARCH or body.get("tool_choice") not in (None, "auto"):
-        return body
-    tools = body.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return body
-    msgs = body.get("messages") or []
-    if awaiting_tool_answer(msgs):
-        return body
-    if not SEARCH_RE.search(last_user_text(msgs)):
-        return body
-    for tool in tools:
-        name = str(((tool or {}).get("function") or {}).get("name") or "")
-        # covers both `web_search` and the prefixed `mcp-cheap-flat_web_search`
-        if name == "web_search" or name.endswith("_web_search"):
-            body["tool_choice"] = {"type": "function", "function": {"name": name}}
-            log("forced tool_choice=%s (the user asked to search)" % name)
-            break
-    return body
-
-
 def apply_route_knobs(body: dict, route: str) -> dict:
     """Per-route sampling knobs: thinking budget, a token floor, a temperature floor."""
     msgs = body.get("messages") or []
@@ -781,7 +734,6 @@ def apply_route_knobs(body: dict, route: str) -> dict:
             value = body.get(field)
             if not isinstance(value, int) or value < TOOLS_MIN_MAX_TOKENS:
                 body[field] = TOOLS_MIN_MAX_TOKENS
-        force_search_call(body)
     return body
 
 

@@ -25,7 +25,7 @@ Usage:
   scripts/toolcheck.py --stream              # same battery over SSE
   scripts/toolcheck.py --seed 0              # unseeded sampling (what users get)
   scripts/toolcheck.py --only tg,none         # the two cases that ever flip
-  scripts/toolcheck.py --url http://127.0.0.1:10001 --model reasoner --budget 32
+  scripts/toolcheck.py --url http://127.0.0.1:10001 --model reasoner --budget 96
                                               # the same case straight at the MoE: the way
                                               # to tell a router bug from a sampling draw
 
