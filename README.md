@@ -544,7 +544,7 @@ reachable as `fast` / `tiny` / `lfm3` (and the 0.6B as `router-0.6b`) while hidi
 
 ### Why "search the web" used to hang (measured 26 Nov)
 
-Five faults stacked into one symptom — an answer that never arrives:
+Six faults stacked into one symptom — an answer that never arrives:
 
 1. **The meta-tools were named after the mechanism, not the effect.**
    `tools_search` / `tool_call` read as "search" / "maybe call something", and the
@@ -581,7 +581,18 @@ Five faults stacked into one symptom — an answer that never arrives:
    marker so the model knows text is missing and can re-query. Above ~1500 the
    JSON also costs seconds of prefill per round, and 12 000 characters of web
    markdown overflow the window outright.
-5. **The end-of-turn marker leaked as text.** The GGUF carries
+5. **Search intents were answered from memory.** Even with the trigger words in
+   the flat tool description, the MoE answered "chi è Gerry Scotti" from its own
+   weights in 1 of 5 runs — and invented a singing career. So the router pins
+   `tool_choice` to the actual function (`{"type":"function","function":{"name":
+   "…_web_search"}}`) when the *last user message* carries a search verb
+   (`cerca`, `cercami`, `search`, `google`, `look up`) and the request carries
+   such a tool. Named, not `"required"`: measured on this build, `"required"` is
+   treated as `auto` (one 82 s prose answer, no call), while the named object is
+   2/2 at 5–8 s. It fires only on the call turn (a tool result in the history
+   means the answer is being written), leaves a client's own `tool_choice`
+   alone, and `ROUTER_FORCE_SEARCH=0` disables it.
+6. **The end-of-turn marker leaked as text.** The GGUF carries
    `</|end_of_sentence|>` as ordinary text pieces, so a degenerate turn *writes*
    it into the answer — that is the `…dimmi chi è</｜end▁of▁sentence>` row Open
    WebUI stored on 26 Nov. The router now appends the model's own stop markers
@@ -599,7 +610,7 @@ that row was the model re-searching, not the cap.
 result) and **`synthweb`** (a 1.5 kB `web_search` payload, the production
 shape): each replays a question + tool call + tool result and requires a
 non-empty answer with no further call. Those are the regression tests for
-faults 3, 4 and 5.
+faults 3, 4 and 6.
 
 ### The other half: the board is shared, and an abandoned request owns it
 
