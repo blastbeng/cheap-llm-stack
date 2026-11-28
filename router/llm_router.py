@@ -49,8 +49,9 @@ once, at the front of the loop: after a tool call has been issued the session ke
 the model that issued it (`sticky-loop`), because a swap is the most expensive
 thing this router can do — 88-120 s of cold load on the 8B tiers, plus the prompt
 cache holding the tool-schema block. A switch happens only when it is unavoidable:
-an image turn for a model with no vision, or the first tool turn of a session that
-started on another route.
+an image turn for a model with no vision, the first tool turn of a session that
+started on another route, or a deep request (on its first turn, and once mid-chat
+when ROUTER_DEEP_ESCALATE=1).
 
 Response headers: X-Route, X-Route-Model, X-Route-By, X-Route-Ms, X-Route-Budget.
 
@@ -181,14 +182,32 @@ LOOP_GUARD_NOTE = os.environ.get(
     "will be available. Do not call a tool: answer now with what you have, and say "
     "explicitly what you could not verify.")
 # The quality tier (llama-swap model `bolt`, Nemotron-3.5-Bolt-E4B) is reached by
-# `auto` when a request is plainly a deep one: long *and* asking for reasoning, on
-# the first turn of a session, which is then pinned there (sticky-deep) so a
-# follow-up does not pay the ~100 s reload back to the MoE. Measured on this board:
-# 2.91 tok/s against the MoE's 10.4, 5.74 GiB of weights, 412 s for one 800-token
-# answer -- which is why the escalation is deliberately narrow and off until the
-# unit sets ROUTER_DEEP_TIER=1.
+# `auto` when a request is plainly a deep one: long *and* asking for reasoning,
+# judged on the last user turn (a client's system prompt is long and technical on
+# every turn, so the concatenation is not a signal). The session is then pinned
+# there (sticky-deep) so a follow-up does not pay the ~100 s reload back to the MoE.
+# With ROUTER_DEEP_ESCALATE=1 a session that started ordinary can still escalate
+# mid-chat, once, as long as no tool result is in flight and there is no image.
+# Measured on this board: 2.91 tok/s against the MoE's 10.4, 5.74 GiB of weights,
+# 412 s for one 800-token answer -- which is why the escalation is narrow and off
+# until the unit sets ROUTER_DEEP_TIER=1.
 DEEP_ENABLED = os.environ.get("ROUTER_DEEP_TIER", "0") == "1"
-DEEP_MIN_CHARS = int(os.environ.get("ROUTER_DEEP_MIN_CHARS", "600"))
+# The "long enough to be worth 3.5x the latency" bar, judged on the last user turn
+# only. 600 chars / 40 words was measured too high for Open WebUI: a real design
+# question ("progetta un indice semantico per 109 tool, quali trade-off...") is
+# ~30 words, so `auto` never left the MoE and `bolt` sat idle for 14 days.
+# Both numbers are knobs because the right value is a latency budget, not a fact:
+# raise them again and `auto` goes back to MoE-only, without a code change.
+DEEP_MIN_CHARS = int(os.environ.get("ROUTER_DEEP_MIN_CHARS", "400"))
+DEEP_MIN_WORDS = int(os.environ.get("ROUTER_DEEP_MIN_WORDS", "25"))
+# Mid-chat escalation: a session pinned to `tools` because Open WebUI attaches the
+# flat surface to every request can still be asked a deep question on turn 3.
+# Off by default (it costs one cold load of 5.7 GB when it fires); the unit sets it.
+DEEP_ESCALATE = os.environ.get("ROUTER_DEEP_ESCALATE", "0") == "1"
+# How long an escalated session is remembered *beyond* the sticky TTL, so that an
+# expiry cannot re-escalate the same chat and start a bolt <-> MoE swap loop
+# (~100 s each way on the microSD).
+DEEP_SEEN_TTL = int(os.environ.get("ROUTER_DEEP_SEEN_TTL", "21600"))
 CONTEXT_LENGTH = int(os.environ.get("ROUTER_CONTEXT_LENGTH", "12288"))
 
 DEFAULT_ROUTE = "assistant"
@@ -589,6 +608,33 @@ def bump(route: str) -> None:
         _stats[route] = _stats.get(route, 0) + 1
 
 
+# Sessions that have already been on the quality tier at least once. Kept apart from
+# _sticky because it outlives it: the sticky entry expires after STICKY_TTL (30 min),
+# and without this memory a long chat could escalate, fall back, escalate again --
+# two model swaps per turn pair, 100 s each on this board.
+_deep_seen: dict[str, float] = {}
+_deep_seen_lock = threading.Lock()
+
+
+def deep_seen(key: str) -> bool:
+    now = time.time()
+    with _deep_seen_lock:
+        stamp = _deep_seen.get(key)
+        if stamp is not None and now - stamp < DEEP_SEEN_TTL:
+            return True
+        _deep_seen.pop(key, None)
+    return False
+
+
+def deep_mark(key: str) -> None:
+    with _deep_seen_lock:
+        if len(_deep_seen) > MAX_STICKY:
+            oldest = sorted(_deep_seen.items(), key=lambda kv: kv[1])[: len(_deep_seen) // 4]
+            for k, _ in oldest:
+                _deep_seen.pop(k, None)
+        _deep_seen[key] = time.time()
+
+
 # --------------------------------------------------------------- language -----
 # Small models drift between languages: the 0.6B tier asked "grazie, sei gentile"
 # in Italian answered in Spanish. One short system line fixes it, ~20 prompt tokens.
@@ -617,6 +663,21 @@ def message_text(messages: list[dict]) -> str:
                 if isinstance(chunk, dict) and chunk.get("type") == "text":
                     parts.append(chunk.get("text", ""))
     return "\n".join(parts).strip()
+
+
+def last_user_text(messages: list[dict]) -> str:
+    """Text of the newest user turn -- the request the decision is actually about.
+
+    `message_text` concatenates system, assistant and tool messages too, and an
+    Open WebUI turn carries a ~1.5 kB system prompt describing the tool surface:
+    it mentions HTTP, docker and tokens before the user has typed anything, and it
+    is longer than any deep threshold. Judged on that text every chat looks deep;
+    judged on the last user turn only, the gate measures the question.
+    """
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return message_text([m])
+    return ""
 
 
 def has_image(messages: list[dict]) -> bool:
@@ -987,7 +1048,7 @@ def looks_deep(text: str) -> bool:
         return False
     if not (REASON_RE.search(text) or TECH_RE.search(text)):
         return False
-    return len(text) > DEEP_MIN_CHARS or len(text.split()) > 40
+    return len(text) > DEEP_MIN_CHARS or len(text.split()) >= DEEP_MIN_WORDS
 
 
 def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
@@ -1021,6 +1082,12 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
     #    model that has to interpret its own tool results, and the one whose prompt
     #    cache holds the tool schema block).
     if has_tools(body) or has_tool_history(msgs):
+        # The deep gate is judged on the last user turn, not on the concatenation:
+        # Open WebUI sends a long system prompt with the tool surface on every turn,
+        # so `text` is always over any length threshold and always mentions HTTP,
+        # docker and tokens. That made the gate depend on how wordy the client's
+        # system prompt was instead of on the question.
+        ask = last_user_text(msgs)
         # ...except the FIRST turn of a session that is plainly a deep reasoning
         # request: Open WebUI attaches the flat tool surface to every request, so
         # without this branch `auto` would never reach the quality tier at all.
@@ -1028,9 +1095,10 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
         # keeps every further turn (tool results included) on the same model.
         # An image request stays on the vision tier: `bolt` has no vision, and
         # the deep rule would otherwise swallow the picture.
-        if (sticky is None and looks_deep(text) and not has_tool_history(msgs)
+        if (sticky is None and looks_deep(ask) and not has_tool_history(msgs)
                 and not has_image(msgs)):
             sticky_put(key, "deep")
+            deep_mark(key)
             return "deep", "deep-first-turn"
         # A loop that has already issued a call is not re-homed. The decision is
         # made once, at the front of the loop; after that a switch is the most
@@ -1042,6 +1110,22 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
         # that has to read its result back.
         if sticky and has_tool_history(msgs):
             return sticky, "sticky-loop"
+        # Mid-chat escalation. A chat whose earlier turns were ordinary ("ciao, che
+        # giorno e' oggi?") is pinned to the MoE, and Open WebUI's tool injection
+        # means the tools branch above owns every later turn: before this, a deep
+        # question on turn 4 could never reach `bolt`, only turn 1 could.
+        # Guarded on all four sides: it must still be the front of a turn (no tool
+        # result in flight -- that model has to read its own result back), no image
+        # (`bolt` is blind), the last user message itself must be the deep one, and
+        # each session may escalate only once, so a TTL expiry cannot start a
+        # bolt <-> MoE swap loop.
+        if (DEEP_ESCALATE and sticky != "deep" and not has_tool_history(msgs)
+                and not has_image(msgs) and looks_deep(ask) and not deep_seen(key)):
+            sticky_put(key, "deep")
+            deep_mark(key)
+            log("escalating session %s: %s -> deep for this turn (one cold load, "
+                "~100 s, 2.9 tok/s from here)" % (key[:12], sticky or "cold"))
+            return "deep", "deep-escalation"
         if sticky and sticky != "tools":
             # First tool turn of a session that started elsewhere: this switch is
             # paid once per session, and it is the last one (sticky-loop holds).
@@ -1080,7 +1164,8 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
     # protocollo TCP e perché il three-way handshake è necessario, con un esempio
     # concreto di connessione." is 24 words / 145 chars and fell through to the
     # default route, where the chat budget cut its thought and leaked it into content.
-    if DEEP_ENABLED and REASON_RE.search(text) and (words > 40 or len(text) > DEEP_MIN_CHARS):
+    if (DEEP_ENABLED and REASON_RE.search(text)
+            and (words >= DEEP_MIN_WORDS or len(text) > DEEP_MIN_CHARS)):
         return "deep", "reasoning-deep"
     if REASON_RE.search(text) and (words > 18 or len(text) > 160):
         return "reason", "reasoning"
@@ -1165,6 +1250,9 @@ class Handler(BaseHTTPRequestHandler):
                     "tool_loop_max_results": TOOL_LOOP_MAX_RESULTS,
                     "repair_text_calls": REPAIR_TEXT_CALLS,
                     "deep_tier": DEEP_ENABLED,
+                    "deep_min_chars": DEEP_MIN_CHARS,
+                    "deep_min_words": DEEP_MIN_WORDS,
+                    "deep_escalate": DEEP_ESCALATE,
                     "context_length": CONTEXT_LENGTH,
                     "prototypes_ready": PROTO.ready.is_set()}
             if not upstream_ok("/health"):

@@ -182,8 +182,8 @@ and costing 57 MB more KV at double the context.
   still ran to 500 tokens = **83 s**. Nothing interactive fits in that, and every
   use of the 4B evicted the MoE, which then took **121 s** to come back from
   microSD. The MoE answers the same questions correctly in ~11 s. The one exception
-  is the narrow `deep` escalation (long *and* reasoning, measured at 265–412 s):
-  see the quality-tier section.
+  is the `deep` escalation (long *and* reasoning, measured at 265–431 s, first
+  turn or mid-chat): see the quality-tier section.
 
 * **Speculative decoding does not pay here.** Measured on the 8B MoE with its
   328M DSpark drafter: 10.2 tok/s → 3.36–5.64 (verification is bandwidth-bound on
@@ -305,26 +305,47 @@ workhorse and the next MoE request pays the cold load again. So:
 * it is reachable deliberately as well: `model: bolt` (aliases `quality`, `deep`,
   `nemotron`, so `cheap/bolt` in LiteLLM works through the wildcard);
 * **`auto` escalates to it.** `ROUTER_DEEP_TIER=1` (set in the unit) turns the
-  `deep` route on. A request is deep when it is long (>600 chars or >40 words)
-  **and** uses reasoning vocabulary, judged on the first turn of a session; that
+  `deep` route on. A request is deep when it is long (now **>400 chars or ≥ 25
+  words**, `ROUTER_DEEP_MIN_CHARS` / `ROUTER_DEEP_MIN_WORDS`) **and** uses reasoning
+  vocabulary, judged on **the last user turn** — not on the whole concatenation,
+  because Open WebUI ships a ~1.5 kB system prompt describing the tool surface on
+  every request: it is longer than any threshold and always mentions HTTP, docker
+  and tokens, so the old gate measured the client's prompt, not the question. The
   session is then pinned to `bolt` (`sticky-deep`), so the tool results coming back
-  are read by the model that asked for them and a follow-up does not pay the
-  ~100 s reload. The route also sends a 128-token thinking budget — a 256-token
-  thought at 2.91 tok/s is 88 s before the first word. Measured end to end through
-  the router:
+  are read by the model that asked for them and a follow-up does not pay the ~100 s
+  reload. The route also sends a 128-token thinking budget — a 256-token thought
+  at 2.91 tok/s is 88 s before the first word.
+
+  **600/40 was measured too high: 14 days of logs, zero `deep`, and `bolt` never
+  loaded from an Open WebUI chat.** The gate only ever fired on essays; a real design
+  question is ~30 words. Two changes came with the new numbers:
+
+  * the gate reads the last user turn (above), and
+  * **mid-chat escalation** (`ROUTER_DEEP_ESCALATE=1`): a chat that starts ordinary
+    is pinned to `tools` on turn 1, and until now only turn 1 could reach the quality
+    tier, so a deep question on turn 4 was answered by the MoE. Now it can escalate
+    once per session (`deep-escalation`) — never while a tool result is in flight
+    and never on an image turn, because those belong to the model that started them.
+
+  Measured end to end through the router (27–28 Nov):
 
   | case | route (why) | wall clock |
   | --- | --- | --- |
   | long M/M/1 design question + the 7-tool MCP surface | `deep` (`deep-first-turn`), 800 tok | **411.8 s** |
   | the same question with no tools | `deep` (`reasoning-deep`), 400 tok | **265.1 s** |
   | tool result inside that session | `deep` (`sticky-deep`), 800 tok | **290.5 s** |
+  | 30-word design question + tools, OWUI-shaped system prompt | `deep` (`deep-first-turn`), follow-up `sticky-deep` | 54.3 s warm, 148 chunks |
+  | **escalation:** chitchat turn, then a 34-word design question, same session | `tools` → `deep` (`deep-escalation`) | 107.5 s + **431.2 s** |
+  | short technical question + tools + the long system prompt | `tools` → `reasoner` (the gate reads the question, not the client's prompt) | 124 s (800 tok) |
   | new short question, new session | `tools` → `reasoner`, 111 tok | 109.8 s (the reload) |
-  | `scripts/toolcheck.py`, full battery, `model: auto` | 9/9, every case `tools`/`reasoner` | 19–83 s/case |
+  | `scripts/toolcheck.py`, full battery, `model: auto` | 9/9 on 27 Nov, 8/9 on 28 Nov, every case `tools`/`reasoner` | 12–120 s/case |
 
-  The last two rows are the price: one deep answer is 4–7 minutes, and getting back
-  to the MoE costs a swap when the session ends. Ordinary tool traffic is untouched
-  — the battery still scores 9/9 through `auto`, and a short tool question is still
-  ~24 s.
+  The deep rows are the price: one deep answer is 4–7 minutes, and getting back to
+  the MoE costs a swap when the session ends. Ordinary tool traffic is untouched —
+  the battery still routes every case to `tools`/`reasoner` (8/9 on 28 Nov: the
+  `synthweb` case now turns the synthesis turn into another `web_search` at the
+  default seed, reproducible, and its routing is unchanged), and a short tool
+  question is still ~24 s.
 
 ## Measured settings
 
@@ -338,7 +359,7 @@ workhorse and the next MoE request pays the cold load again. So:
 | fast tier ctx | **8192** | LFM3-1.7B: 4k strangled a client that sends a system prompt plus a conversation; 8k is ~50 MB of KV and the first turn pays the prefill once |
 | VLM ctx | **6144** | 4096 strangled any client that sends a system prompt plus a conversation, and a VLM also pays ~1k tokens for one image; the 2k extra are cheap in RAM and later turns ride the prompt cache |
 | `--parallel` | **1** | compute buffers are sized per slot (default 4 cost ~1 GB/model) and one slot keeps the tool-schema prompt cache alive |
-| `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis, 128 on the `deep` tier — 256 there is 88 s of thinking before the first word) |
+  | `--reasoning-budget` | **32** | server default only: the router overrides it per route (96 call turn, 256 synthesis, 128 on the `deep` tier — 256 there is 88 s of thinking before the first word) |
 | load mode | `mmap+mlock` core, `mmap` heavy | core never pages out; the 5.0 GB MoE stays reclaimable |
 
 ### RAM, measured (this is what forced the sizes above)
@@ -429,7 +450,8 @@ throws away the prompt cache that makes agent traffic affordable. (An earlier
 
 Response headers `X-Route`, `X-Route-Model`, `X-Route-By`, `X-Route-Ms`,
 `X-Route-Budget` show what was chosen and why (`client`, `sticky`, **`tools`**,
-`image`, `image+ocr-hint`, **`deep-first-turn`**, **`reasoning-deep`**,
+`image`, `image+ocr-hint`, **`deep-first-turn`**, **`deep-escalation`**,
+  **`reasoning-deep`**,
 **`sticky-deep`**, `chitchat`, `code`, `reasoning`, `trivial`,
 `translate-short`, `semantic(0.71/0.09)`, `semantic-fast-rejected`, `default`).
 
@@ -456,10 +478,13 @@ agent turn":
   `vision`/`vision-docs` even with tools in the body. Before this rule the router
   sent every image to the MoE, blind: measured, `image+tools` now answers the text
   in the picture in 43.1 s on `by=image`.
-* **the first turn of a deep session wins over tools.** Long (>600 chars or >40
-  words) *and* reasoning vocabulary *and* no tool history → `deep` on `bolt`, and
-  the session is pinned there (`sticky-deep`) so the tool results that come back
-  are read by the model that asked for them. See the quality-tier section.
+* **a deep question wins over tools, on the first turn and once mid-chat.** Long
+  (>400 chars or ≥ 25 words, judged on the last user turn) *and* reasoning
+  vocabulary *and* no tool history → `deep` on `bolt`, and the session is pinned
+  there (`sticky-deep`) so the tool results that come back are read by the model that
+  asked for them. Mid-chat escalation (`ROUTER_DEEP_ESCALATE=1`) fires at most once
+  per session, and never while a tool result is in flight. See the quality-tier
+  section.
 
 An explicit model id is normally forwarded verbatim — that is how you debug one
 tier. The one exception is the fast tier: a request addressed to `router`, `fast`,
@@ -723,8 +748,9 @@ is a *direct* llama-swap model that bypasses that decision.
 
 | picker id | what it really is | when to use |
 |---|---|---|
-| `cheap/auto` | router, picks per request | always; it is the only id that can reach the tools *and* `deep` tiers |
+  | `cheap/auto` | router, picks per request | always; it is the only id that can reach the tools *and* `deep` tiers |
 | `cheap/reasoner` | LFM2.5-8B-A1B, pinned | when you know you want the MoE and want to skip routing |
+| `cheap/bolt` | Nemotron-3.5-Bolt-E4B, pinned | when you want the quality tier by hand and want to skip routing; it supports tools, and it swaps the MoE out (105 s cold load, 2.9 tok/s, ~40 s before the first word) |
 | `cheap/vision` | LFM3-VL-2B | images, OCR |
 | `cheap/embedding-model` | Qwen3-Embedding-0.6B | never — it is an embedding model, not a chatbot |
 | `cheap/router` | LFM3-1.7B fast tier | **hidden** (`is_active 0`): the name collides with the router's own magic id `router`, which means "route this", so picking it looked like routing and instead pinned the fast tier |

@@ -27,12 +27,19 @@ Environment=ROUTER_TOOL_LOOP_MAX_RESULTS=10
 # regression; 0 disables it.
 Environment=ROUTER_REPAIR_TEXT_CALLS=1
 # Quality tier escalation from `auto`: ON. A request that asks for reasoning and is
-# longer than ROUTER_DEEP_MIN_CHARS (600) chars or 40 words goes to Nemotron-3.5-Bolt
-# for its whole session, including the turns that carry tool results; everything else
-# stays on the MoE. The cost is explicit: 2.91 tok/s instead of 10.4 and ~100 s of
-# reload the first time either model has to come back.
+# longer than ROUTER_DEEP_MIN_CHARS (400) chars or ROUTER_DEEP_MIN_WORDS (25) words
+# goes to Nemotron-3.5-Bolt for its whole session, including the turns that carry
+# tool results; everything else stays on the MoE. The bar is judged on the last user
+# turn only. 600/40 was measured too high: a real design question is ~30 words, so
+# `auto` never left the MoE in 14 days of logs. The cost is explicit: 2.91 tok/s
+# instead of 10.4 and ~100 s of reload the first time either model has to come back.
 Environment=ROUTER_DEEP_TIER=1
-Environment=ROUTER_DEEP_MIN_CHARS=600
+Environment=ROUTER_DEEP_MIN_CHARS=400
+Environment=ROUTER_DEEP_MIN_WORDS=25
+# Mid-chat escalation: ON. A chat that started ordinary can move to the quality tier
+# once, when a later user turn is the deep one. Never mid tool-loop (that model has
+# to read its own result back) and never on an image turn (`bolt` is blind).
+Environment=ROUTER_DEEP_ESCALATE=1
 ExecStart=/usr/bin/python3 /opt/cheap-llm-stack/router/llm_router.py
 Restart=always
 RestartSec=3
