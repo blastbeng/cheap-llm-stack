@@ -547,7 +547,7 @@ of them bit us:
   21–35 tok/s, so a 7.6k prompt costs 4–6 minutes *per request*. More context only
   buys room for the schemas to fill. It was still worth going 4096 → 6144 on the
   tiny/VLM tiers (see Measured settings), because once the surface is down to
-  7 tools the *fixed* part of the prompt is 1.3k (0.7k with the two meta-tools
+  10 tools the *fixed* part of the prompt is 1.8k (0.7k with the two meta-tools
   alone) and the cache makes later turns nearly free — the extra room then goes
   to the conversation, which is the point.
 
@@ -563,11 +563,12 @@ So, for every model that shadows a connection id (Workspace → Models, or
    of attached file content, and with every category off it emits no schema.
 2. `meta.capabilities` — `terminal`, `web_search`, `image_generation`,
    `code_interpreter`, `memory` false; `vision` true only on `cheap/vision`.
-3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 7 tools, 4,421
-   characters of schema — five flat everyday tools (`web_search`,
-   `web_url_read`, `send_message`, `read_image`, `chroma_query_documents`) plus
-   the two meta-tools (`find_tool`, `run_tool`) that keep the whole 109-tool
-   gateway reachable. In Open WebUI a global `inlet` filter injects that id into
+3. Attach **`mcp-tools-lite`** (`server:mcp:mcp-tools-lite`): 10 tools, 7,055
+   characters of schema / **1,831 prompt tokens** — eight flat everyday tools
+   (`web_search`, `web_url_read`, `search_and_read`, `send_message`,
+   `read_image`, `chroma_query_documents`, `terminal_run`, `terminal_file`)
+   plus the two meta-tools (`find_tool`, `run_tool`) that keep the whole
+   109-tool gateway reachable. In Open WebUI a global `inlet` filter injects that id into
    every chat, so `TOOL_IDS` there must equal the connection's `info.id`. That
    filter is also where the orchestration is consolidated: it *strips* every
    tool id for `cheap/router` (the tiny tier never gets one, not even when
@@ -578,7 +579,7 @@ So, for every model that shadows a connection id (Workspace → Models, or
 4. Leave `chat.tool_search` and `chat.context_compaction` off — both add a pass
    over the prompt, and compaction cannot fit a 6k model anyway.
 
-### One surface, five flat tools (`mcp-tools-lite`)
+### One surface, flat tools next to the meta-tools (`mcp-tools-lite`)
 
 The meta-tool surface is a good trade for a large model: 678 prompt tokens buy
 109 tools. It is a **bad** trade for the 8B-A1B MoE, because it turns one job
@@ -600,16 +601,20 @@ into two decisions and the second one keeps failing:
 
 So the same proxy advertises the everyday tools **flat, next to** the
 meta-tools: one connection, one surface, nothing else to keep in sync.
-`tools/list` answers 7 tools / 4,421 characters of schema / **1,287 prompt
-tokens**, against 678 for the two meta-tools alone and 71 for none.
+`tools/list` answers 10 tools / 7,055 characters of schema / **1,831 prompt
+tokens** (`cl100k_base`), against 678 for the two meta-tools alone and 71 for
+none.
 
 | flat tool | why it is in the set | schema |
 |---|---|---|
-| `web_search` | the original failure; curated `query` + `count` | 682 chars |
-| `web_url_read` | the second step of a search (`url` + `maxLength`) | 445 |
+| `web_search` | the original failure; curated `query` + `count` | 828 chars |
+| `web_url_read` | the second step of a search (`url` + `maxLength`) | 528 |
+| `search_and_read` | the proxy's own: search **and** read the top hit in one call, one hop instead of two | 790 |
 | `send_message` | Telegram notify; `text` only, the chat is fixed | 331 |
 | `read_image` | one path in, ImageContent out | 321 |
 | `chroma_query_documents` | "what did we decide before?"; `query` only | 412 |
+| `terminal_run` | a shell on the media host (Open Terminal); `command` + optional `process_id` to follow a long job | 876 |
+| `terminal_file` | read/write one text file through the same API | 733 |
 
 `web_search` and the other hand-written specs are in `proxy.py`; anything named
 in `MCP_LITE_FLAT_TOOLS` without one gets a compact schema generated from the
@@ -631,21 +636,37 @@ with type/enum/default). Three details are not cosmetic:
   ids, distances, `null` arrays) is what the synthesis turn copies instead of
   the content, and it is re-sent on every following turn (see fault 4).
 
+**`terminal_run` / `terminal_file` (28 Nov).** In Open WebUI the terminal is not
+a tool server: attaching it to a model costs its whole 22-tool surface (17.6 kB
+of schema, **4,619 tokens**) on every turn. The same Open Terminal REST API as
+two flat tools costs **1,609 chars / 422 tokens**, and no new process:
+`mcp-tools-lite` joins the external network `open-terminal-net`, holds the
+bearer key and forwards; the commands run inside the `open-terminal` container
+itself (uid 1000, cwd `/home/user`, no docker socket), i.e. the same sandbox the
+panel already uses. Measured on `cheap/auto` through the router, "quanti file e
+directory ci sono in /opt/projects/personal-ai-stack?": hop 1 calls
+`terminal_run` twice (`find … | wc -l`), hop 2 answers 1.875 file / 326
+directory — **2 hops, 115 s**, 2,202 prompt tokens of which 2,096 cached. Output
+is cut at 1,400 chars with an explicit "… not shown: rerun a narrower command
+(grep, head, tail)" marker, just under the router's `TOOL_RESULT_MAX_CHARS`, so
+the model is never handed half a log that looks whole.
+
 Enabled per deployment, so the proxy stays generic:
 
 ```yaml
   mcp-tools-lite:
     ports: ["8814:8814"]         # one container, one index cache
     environment:
-      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,send_message,read_image,chroma_query_documents"
+      MCP_LITE_FLAT_TOOLS: "web_search,web_url_read,search_and_read,send_message,read_image,chroma_query_documents,terminal_run,terminal_file"
       MCP_LITE_MEMORY_COLLECTION: "aiderdesk_cheap-llm-stack_memory"
-      MCP_LITE_FLAT_MAX_RESULTS: "3"
-      MCP_LITE_FLAT_SNIPPET: "220"
+      MCP_LITE_TERMINAL_URL: "http://open-terminal:8000"   # empty = kill switch
+      MCP_LITE_FLAT_MAX_RESULTS: "5"
+      MCP_LITE_FLAT_SNIPPET: "500"
 ```
 
 With `MCP_LITE_FLAT_TOOLS` empty the surface is the old two meta-tools, so any
 other client of :8814 is unaffected. The proxy logs the surface once per change
-(`surface: 7 tools, 4421 chars of schema (...)`).
+(`surface: 10 tools, 7055 chars of schema (...)`).
 
 Measured on the production sentence ("Cerca sul web chi è Gerry Scotti e dimmi
 chi è in due frasi"), streaming, seeds 5/15/25, three everyday asks:
@@ -673,7 +694,7 @@ DROP_TOOL_IDS = ("server:mcp:mcp-cheap-flat",)   # removed server: stale chats c
 
 `cheap/router` still gets **no** tools at all. Nothing outside the connection
 changes — a cloud model (`anthropic/claude-sonnet-4.5`, `openai/gpt-5`, …) keeps
-exactly the tool ids it had and drives the same 7-tool surface through
+exactly the tool ids it had and drives the same 10-tool surface through
 `find_tool` / `run_tool` as before.
 
 A second container (`mcp-tools-lite-flat` on :8815, one flat tool, no
@@ -682,7 +703,7 @@ cache copy, because two containers meant two 109-tool indexes (192 MB each),
 two connections to keep aligned and two surfaces that could drift.
 
 Measured with this profile: `cheap/router` carries **50 prompt tokens** and no
-tools at all; the MoE carries 1,287 on the first turn and **0.3 s on the
+tools at all; the MoE carries 1,831 on the first turn and **0.3 s on the
 following turn** — with a constant surface the chat prefix stays byte-identical,
 llama.cpp reuses its cache and only the new message is prefilled. That cache
 hit is the real payoff of a small tool surface, more than the tokens
@@ -728,7 +749,7 @@ Five faults stacked into one symptom — an answer that never arrives:
    prompt tokens. Old names still dispatch, so existing prompts keep working.
    This was necessary but **not sufficient**: the indirection itself is beyond
    the MoE, so the same surface now advertises five flat everyday tools next to
-   the meta-tools (0/6 → **6/6**, see the "One surface, five flat tools"
+   the meta-tools (0/6 → **6/6**, see the "One surface, flat tools"
    section).
 2. **Ranking lost to verbose descriptions.** Cosine similarity over
    `name + description` put `query-docs` above `web_search` for "search the web
