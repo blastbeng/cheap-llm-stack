@@ -29,8 +29,8 @@ model to keep interpreting its own tool results, so a tool conversation must nev
 be downgraded to the fast tier and must never bounce between models: the split
 decision below is made once and re-pinned in the sticky table. Measured on the
 7-case battery (5 tools, parallel calls, one negative case, IT+EN) the MoE scores
-7/7 at reasoning_budget_tokens=32, while the 0.6B scores 7/7 but mangles tool
-arguments and writes poor prose, and the previous workhorse scored 1/7.
+7/7 at reasoning_budget_tokens=32, while the old 0.6B tier scored 7/7 but mangled
+tool arguments and wrote poor prose, and the previous workhorse scored 1/7.
 `reasoning_budget_tokens` is injected per route because it is the one sampling knob
 that changes behaviour here: at 0 the MoE spills its thinking into `content`
 (5/7, 52 s per call), at 32 it is 7/7 in 17.9 s, at 96 still 7/7 but 24.1 s — so
@@ -58,8 +58,8 @@ The router also advertises a synthetic model id, `auto`, in GET /v1/models. With
 it a client can only pick a raw llama-swap id (router, reasoner, vision,
 embedding-model), which is passed through verbatim and therefore *bypasses* every
 decision above. `auto`, `router` and `orchestrator` are the three magic ids that
-mean "route this request"; the tiny tier keeps the `router-0.6b` alias so it can
-still be addressed directly when debugging.
+mean "route this request"; the fast tier also answers to `fast`, `tiny` and `lfm3`
+so it can still be addressed directly when debugging.
 """
 
 from __future__ import annotations
@@ -194,7 +194,7 @@ ROUTE_MODEL = {
 # these is redirected to the tools route (see Handler.do_POST): the MoE scores 9/9
 # on the 9-case battery and LFM3-1.7B 7/9, and per-call latency is within 2 s of each
 # other (7.6-11.3 s vs 5.9-12.6 s), so the MoE's accuracy is what decides.
-TINY_MODELS = {"router", "router-0.6b", "fast", "tiny", "tiny-0.6b", "lfm3"}
+TINY_MODELS = {"router", "fast", "tiny", "lfm3"}
 
 # --------------------------------------------------------------- prototypes ---
 # One short utterance per intent, in English and Italian (this stack is used in
@@ -250,9 +250,9 @@ PROTOTYPES = {
 # ---------------------------------------------------------------- rule hints ---
 # An actual snippet or crash in the message, not the *name* of a technology. The
 # difference matters: "riassumi in 5 punti i vantaggi di Rust rispetto a Go" is 10
-# words and used to hit this rule through the word "rust", land on the 0.6B and come
-# back with three shallow lines. Technology vocabulary lives in TECH_RE and now only
-# guards the tiny tier; a shortcut to it needs code you can point at.
+# words and used to hit this rule through the word "rust", land on the (then) 0.6B
+# and come back with three shallow lines. Technology vocabulary lives in TECH_RE and
+# now only guards the fast tier; a shortcut to it needs code you can point at.
 CODE_RE = re.compile(
     r"```|~~|\bdef\s+\w+\s*\(|\bclass\s+\w+|\bfunction\s+\w+\(|\bimport\s+\w+|#include"
     r"|\bTraceback \(most recent call last\)|\b\w+Error:|\bsegfault\b|\bnull pointer\b"
@@ -283,23 +283,24 @@ SHORT_HINT_RE = re.compile(
     r"|che|chi|quando|dove|quanto|quanti|qual|quale|quali|definisci|converti)\b",
     re.IGNORECASE,
 )
-# Greetings, thanks, "are you there": the only requests where 0.6B is unambiguously
-# good enough. Kept narrow on purpose — small talk is cheap only if it stays small.
+# Greetings, thanks, "are you there": the only requests where the fast tier is
+# unambiguously good enough. Kept narrow on purpose — small talk is cheap only if it
+# stays small.
 CHITCHAT_RE = re.compile(
     r"^\W*(ciao|salve|hey|hi|hello|buongiorno|buonasera|grazie|thanks|thank you|ok|okay"
     r"|sei (li|connesso)|ci sei|come stai|how are you|che ore|what time)\b",
     re.IGNORECASE,
 )
-# Asking the model to *produce* or *change* code is never a 0.6B job, however short
-# the sentence: "scrivi una funzione python ..." is 9 words and was routed to the
-# tiny tier, which then wrote broken docstring prose.
+# Asking the model to *produce* or *change* code is never a fast-tier job, however
+# short the sentence: "scrivi una funzione python ..." is 9 words and used to land
+# on the 0.6B, where it came back as broken docstring prose.
 GENERATE_RE = re.compile(
     r"\b(write|create|implement|generate|refactor|fix|add|rewrite|convert .* (to|into)"
     r"|scrivi|crea|implementa|genera|rifattorizza|correggi|aggiungi|riscrivi|sistema)\b",
     re.IGNORECASE,
 )
 # Anything that asks for an explanation, a comparison or a why/how does NOT belong on
-# the 0.6B: asked to explain a MoE it answered "Un MoE (Moyen d'Équipe)" — 2 s of
+# the fast tier: the (then) 0.6B answered "Un MoE (Moyen d'Équipe)" — 2 s of
 # latency saved are not worth a hallucinated acronym.
 EXPLAIN_RE = re.compile(
     r"\b(explain|describe|summar|compare|difference|why|how (does|do|is|are)|tell me about"
@@ -307,8 +308,9 @@ EXPLAIN_RE = re.compile(
     r"|\bcos'?\s?[eè] (un|una|il|la|lo|i|gli|le|l')\b|\bche cos'?[eè]\b|\bwhat(?:'s| is) a\b",
     re.IGNORECASE,
 )
-# Vocabulary that turns even a 5-word question into a job for the MoE: the 0.6B
-# invents acronyms when asked about anything technical ("MoE = Model of Explanation").
+# Vocabulary that turns even a 5-word question into a job for the MoE: a 0.6B-tier
+# model invents acronyms when asked about anything technical ("MoE = Model of
+# Explanation").
 TECH_RE = re.compile(
     r"\b(moe|llm|model of experts|mixture of experts|transformer|attention|embedding|token"
     r"|quantizzazion\w*|quantization|gguf|lora|qlora|kv[- ]cache|context window|thread|mmap"
@@ -318,7 +320,7 @@ TECH_RE = re.compile(
 )
 # Questions that need stored world knowledge, not a one-liner. "Chi ha scritto la
 # Divina Commedia e in che anno è ambientata?" is 11 words and starts with "chi",
-# so it matched the trivial rule and the 0.6B answered "periodo 1301-1310".
+# so it matched the trivial rule and the (then) 0.6B answered "periodo 1301-1310".
 FACTUAL_RE = re.compile(
     r"\b(chi ha (scritto|detto|fatto|inventato|creato|dipinto|composto)"
     r"|in che (anno|secolo|periodo|epoca)"
@@ -570,8 +572,8 @@ def bump(route: str) -> None:
 
 
 # --------------------------------------------------------------- language -----
-# The 0.6B drifts between languages: asked "grazie, sei gentile" in Italian it
-# answered in Spanish. One short system line fixes it and costs ~20 prompt tokens.
+# Small models drift between languages: the 0.6B tier asked "grazie, sei gentile"
+# in Italian answered in Spanish. One short system line fixes it, ~20 prompt tokens.
 LANG_HINT = "Rispondi nella stessa lingua dell'utente. Sii breve e concreto."
 
 
@@ -857,7 +859,7 @@ def decide(body: dict, headers, client_ip: str) -> tuple[str, str]:
         return route, reason
 
     # 0b. agent turns win over everything else, including stickiness: a conversation
-    #    that started as chitchat and now carries tools must not stay on the 0.6B,
+    #    that started as chitchat and now carries tools must not stay on the fast tier,
     #    and a tool loop must keep hitting the model that issued the call (it is the
     #    model that has to interpret its own tool results, and the one whose prompt
     #    cache holds the tool schema block).
@@ -941,7 +943,7 @@ def _decide_cold(msgs: list[dict], text: str, body: dict) -> tuple[str, str]:
         and SHORT_HINT_RE.search(low)
         and not EXPLAIN_RE.search(text)
         and not TECH_RE.search(text)
-        # facts and named entities are not trivia: the 0.6B gets them wrong
+        # facts and named entities are not trivia: a 1.7B gets them wrong
         and not FACTUAL_RE.search(text)
         and not has_proper_noun(text)
     ):
@@ -1042,7 +1044,7 @@ class Handler(BaseHTTPRequestHandler):
                 # A concrete id is forwarded verbatim (that is how a client debugs one
                 # tier), with one exception: a tool request must never land on the fast
                 # tier. LFM3-1.7B does emit calls (7/9 at Q4_0) but the 8B MoE is
-                # 9/9 at the same per-call latency, and the 0.6B mangles arguments.
+                # 9/9 at the same per-call latency.
                 # Tool orchestration lives on the MoE, so this is not a downgrade.
                 if requested.lower() in TINY_MODELS and (
                     has_tools(body) or has_tool_history(body.get("messages") or [])

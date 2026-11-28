@@ -24,7 +24,7 @@
 #   * one VLM covers images: LFM3-VL-2B reads the same invoice text as Qwen3-VL-2B in
 #     24 s vs 113 s and takes 1.25 GB instead of 2.4 GB. It replaces both the old
 #     Qwen3.5-2B "assistant" and the Qwen3-VL-2B "vision-docs".
-#   * resident set: embedding + 0.6B + MoE ≈ 6.5 GB, leaving several GB of page cache
+#   * resident set: embedding + fast tier + MoE ≈ 6.5 GB, leaving several GB of page cache
 #     for the VLM so a swap is seconds, not a microSD read.
 #   * never swap the embedding model: it is in the "core" group with persistent: true.
 
@@ -43,8 +43,8 @@ macros:
   # 2 threads = one per Cortex-A76 (generation is memory-bandwidth bound);
   # 8 batch threads across both clusters maximises prefill.
   # parallel 1: llama.cpp allocates one compute-buffer set per slot, and this board
-  # serves one request at a time. The default of 4 cost ~1 GB per model (measured:
-  # Qwen3-0.6B 1.79 GB -> 0.96 GB, Qwen3.5-2B 3.53 GB -> 2.4 GB). That is what makes
+  # serves one request at a time. The default of 4 cost ~1 GB per model (measured
+  # on the then 0.6B fast tier: 1.79 GB -> 0.96 GB, Qwen3.5-2B 3.53 GB -> 2.4 GB). That is what makes
   # four resident models + the MoE fit in 12 GB. One slot also keeps the prompt cache
   # for the tool schema block alive between turns, which is what makes agent clients
   # usable here (a 1k-token tools+system prefix cost 43 s cold, 4-6 s warm).
@@ -97,8 +97,8 @@ routing:
 # No `hooks.on_startup.preload` here, on purpose.
 #
 # The three core models must never be cold: measured, the first "ciao" after a
-# reboot spent 141 s waiting for the 0.6B to load instead of 13 s with its weights
-# in page cache. But llama-swap's preload is the wrong tool for it. It is
+# reboot spent 141 s waiting for the (then) 0.6B fast tier to load instead of 13 s
+# with its weights in page cache. But llama-swap's preload is the wrong tool for it. It is
 # implemented as a synthetic `GET /` routed to the model, and the status of that
 # GET is what it reports as success (upstream internal/server/api.go:
 # startPreload). Our llama.cpp is built with -DLLAMA_USE_PREBUILT_UI=OFF and has
@@ -165,32 +165,6 @@ models:
       - fast
       - tiny
       - lfm3
-    checkEndpoint: /health
-    capabilities:
-      in: [text]
-      out: [text]
-      tools: true
-
-  # The 0.6B stays installed and addressable, not resident: it answers a 40-token
-  # chitchat reply in 1.05 s where anything bigger needs seconds, so it is the tool
-  # to reach for when latency matters more than prose. It must never see a tool
-  # request: it does emit tool_calls (7/7) but mangles the arguments.
-  router-0.6b:
-    name: "Qwen3-0.6B · 1 s chitchat · optional"
-    cmd: >
-      ${llama_bin}
-      -m ${models_dir}/Qwen3-0.6B-Q8_0.gguf
-      --host 127.0.0.1 --port ${PORT}
-      ${thr_args}
-      --ubatch-size 256
-      --ctx-size 6144 ${kv_args}
-      ${gen_args}
-      --reasoning off
-      --alias router-0.6b
-      --load-mode mmap
-    ttl: 300
-    aliases:
-      - tiny-0.6b
     checkEndpoint: /health
     capabilities:
       in: [text]

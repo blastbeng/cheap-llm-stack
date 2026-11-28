@@ -221,11 +221,10 @@ fetch() { # repo remote_file local_file
         "${HF_BASE}/${repo}/resolve/main/${remote}" -o "${out}"
 }
 
-# Five models, nothing else. The list is also the prune whitelist (--prune-models).
+# Four models, nothing else. The list is also the prune whitelist (--prune-models).
 REQUIRED_MODELS=(
     "Qwen3-Embedding-0.6B-Q8_0.gguf"       # embedding-model    (mandatory, always on)
     "LFM3-1.7B-QAD-Q4_0.gguf"              # router             (fast tier: chitchat / one-liners)
-    "Qwen3-0.6B-Q8_0.gguf"                 # router-0.6b        (optional 1 s chitchat tier)
     "Moon-Beam-8B-A1B-IQ4_XS.gguf"         # reasoner           (default + tool calling)
     "LFM3-VL-2B-QAD-Q4_0.gguf"             # vision             (images / OCR)
     "mmproj-LFM3-VL-2B-Q8_0.gguf"          # vision projector
@@ -246,10 +245,9 @@ if [ "${SKIP_MODELS}" = 0 ]; then
     fetch "Qwen/Qwen3-Embedding-0.6B-GGUF" "Qwen3-Embedding-0.6B-Q8_0.gguf"
 
     # fast tier: greetings, one-liners, short translations. LFM3-1.7B decodes at the
-    # same 10.1 tok/s as the 8B MoE with 1.8x its prefill and 1 GB of weights;
-    # Qwen3-0.6B stays as the optional 1 s chitchat tier (router-0.6b).
+    # same 10.1 tok/s as the 8B MoE with 1.8x its prefill and 1 GB of weights, so it
+    # is the whole fast tier: the 0.6B it replaced kept nothing but 0.64 GB of disk.
     fetch "LiquidAI/LFM3-1.7B-GGUF" "LFM3-1.7B-QAD-Q4_0.gguf"
-    fetch "Qwen/Qwen3-0.6B-GGUF" "Qwen3-0.6B-Q8_0.gguf"
 
     # text workhorse + tool calling: Moon-Beam-8B-A1B, bailingmoe3 7.89B total /
     # 1.3B active per token, IQ4_XS. 9/9 on the 9-case tool battery against 8/9 for

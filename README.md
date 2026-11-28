@@ -17,10 +17,9 @@ client ──► :10000  llm-router          content-aware orchestrator (Python,
               └── vision                LFM3-VL-2B    QAD-Q4_0   6k   heavy, images / OCR
 ```
 
-Four ids, one job each (plus the optional 0.6B). Anything that needs to think, write or call a tool goes
-to the 8B MoE; greetings, one-liners and short translations go to the 1.7B (with the
-0.6B kept installed for when 1 s latency matters more than prose); anything with a
-pixel in it goes to the VLM; embeddings are always on.
+Four ids, one job each. Anything that needs to think, write or call a tool goes to
+the 8B MoE; greetings, one-liners and short translations go to the 1.7B; anything
+with a pixel in it goes to the VLM; embeddings are always on.
 
 ## Why this shape
 
@@ -30,7 +29,7 @@ pixel in it goes to the VLM; embeddings are always on.
 
   | model | file | tg (tok/s) | pp (tok/s) | note |
   | --- | --- | --- | --- | --- |
-  | Qwen3-0.6B Q8_0 | 0.62 GB | **16.2** | 92 (`-t 2`) / 125 (`-t 8`) | optional 1 s tier |
+  | Qwen3-0.6B Q8_0 | 0.62 GB | **16.2** | 92 (`-t 2`) / 125 (`-t 8`) | retired: replaced by LFM3-1.7B |
   | **Moon-Beam-8B-A1B (MoE) IQ4_XS** | 5.00 GB | **8.4** | 20.3 (`-t 2`) / 30.8 (`-t 8`) | shipped, default + tools |
   | LFM2.5-8B-A1B (MoE) Q4_0 | 4.85 GB | 10.4 | 23.2 (`-t 2`) / 37.3 (`-t 8`) | previous default, 8/9 tools |
   | **LFM3-1.7B QAD-Q4_0** | 1.05 GB | **10.1** | 41.4 (`-t 2`) / 62.9 (`-t 8`) | shipped, fast tier |
@@ -60,7 +59,7 @@ pixel in it goes to the VLM; embeddings are always on.
   | LFM2.5-8B-A1B, `reasoning_budget_tokens=32` | 7/7 | 17.9 s | short battery prompts only — starves the real Open WebUI one, see below |
   | **LFM2.5-8B-A1B, budget 96** | **7/7** | 24.1 s | shipped for tool turns: same score, +35 % here, but the only reliable value once the prompt carries a system message |
   | LFM2.5-8B-A1B, budget 0 | 5/7 | 52 s | thinking leaks into `content` → unusable |
-  | Qwen3-0.6B Q8 | 7/7 | 14–21 s | mangles arguments, poor prose |
+  | Qwen3-0.6B Q8 (retired) | 7/7 | 14–21 s | mangles arguments, poor prose |
   | LFM2.5-1.2B-Instruct Q8 | 6/7 | 28 s | refuses `save_memory` |
   | LFM3-1.7B Q4_K_M | 6/7 | 37–89 s | one empty answer |
   | LFM3-VL-2B QAD-Q4_0 | 6/7 | — | also handles image + tools |
@@ -352,13 +351,14 @@ workhorse and the next MoE request pays the cold load again. So:
 | LFM3-1.7B | 1.05 GB | ~1.0 GB | 8192 |
 | Moon-Beam-8B-A1B | 5.00 GB (mmap) | **2.44 GB** (Rss 6.97 GB with the mapped weights) | 16384 |
 | LFM3-VL-2B + mmproj | 1.05 + 0.20 GB | 1.28 GB | 6144 |
-| Qwen3-0.6B (optional) | 0.62 GB | 1.00 GB | 6144 |
 
 `Anonymous` from `smaps_rollup` with all four loaded: 7.6 GB, `free` reports
-9.5 GB used and 2.4 GB available, no OOM, 64 °C. The ctx bump costs 59 KB/token on
-the 0.6B — measured 905 MB at 4096 vs 1025 MB at 6144, which is exactly the q8_0 KV
-size, so it is the only part that scales. Both layers that cap a prompt agree on the
-new number: with a prompt above the window, the proxy's clamp reports
+9.5 GB used and 2.4 GB available, no OOM, 64 °C. (That set still counted the 0.64 GB
+0.6B, retired since: removing it buys that disk back, not RAM — it was never
+resident.) The ctx bump costs 59 KB/token on that model — measured 905 MB at 4096 vs
+1025 MB at 6144, exactly the q8_0 KV size, so it is the only part that scales. Both
+layers that cap a prompt agree on the new number: with a prompt above the window,
+the proxy's clamp reports
 `"context_tokens": 6144` for `cheap/router`, and `cheap/vision` reaches the board and
 is refused with `available context size (6144 tokens)` — nothing still assumes 4096.
 
@@ -384,8 +384,8 @@ request reloads it (~100 s cold, seconds while the page cache is warm). Measured
 after a `bolt` turn: `reasoner ready`,
 `embedding-model ready`, `router ready`, 3.7 GB available.
 
-The VLM is *not* resident: with embedding + 0.6B + VLM + MoE loaded the board once
-had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
+The VLM is *not* resident: with embedding + fast tier + VLM + MoE loaded the board
+once had 226 MB available and the kernel swapped the whole `router` tier (896 MB) and
 2 GB of the MoE's KV into zram.
 
 The fast tier *is* kept warm even though it is evictable, because it answers the
@@ -445,7 +445,7 @@ Tool turns are decided **before** everything else, including stickiness:
   content part in the history → route `tools` (we are mid-loop and must keep
   hitting the model that issued the call);
 * the session's sticky entry is re-pinned to `tools`, so a conversation that
-  started as `ciao` cannot stay on the 0.6B once a tool appears.
+  started as `ciao` cannot stay on the fast tier once a tool appears.
 
 Two rules sit in front of that branch, and both exist because Open WebUI attaches
 the flat tool surface to *every* request, so "has tools" stopped meaning "is an
@@ -462,12 +462,12 @@ agent turn":
   are read by the model that asked for them. See the quality-tier section.
 
 An explicit model id is normally forwarded verbatim — that is how you debug one
-tier. The one exception is the fast tier: a request addressed to `router`,
-`router-0.6b`, `fast` or `tiny` that carries `tools` (or a tool history) is
-answered by the `tools` route instead, and reports `X-Route-By: tools-on-tiny`.
-Tool orchestration lives on the MoE: LFM3-1.7B does emit calls (7/8 at Q4_0, 8/8 at
-Q8_0) but the MoE is 9/9 on the current 9-case battery, its per-call latency is the
-same (7.6-11.3 s against 5.9-12.6 s), and the 0.6B mangles the arguments.
+tier. The one exception is the fast tier: a request addressed to `router`, `fast`,
+`tiny` or `lfm3` that carries `tools` (or a tool history) is answered by the `tools`
+route instead, and reports `X-Route-By: tools-on-tiny`.
+Tool orchestration lives on the MoE: LFM3-1.7B does emit calls (7/9 at Q4_0, 8/8 at
+Q8_0) but the MoE is 9/9 on the current 9-case battery and its per-call latency is
+the same (7.6-11.3 s against 5.9-12.6 s).
 `router` as a *routing* id (`auto`, `router`, `orchestrator`) never reaches this
 check — `tools` wins before the model is picked.
 
@@ -505,7 +505,7 @@ bypasses the router, and therefore the floor, on purpose.
 
 ### Routing guards
 
-Three exist because the 0.6B failed on them in testing: a request that *writes*
+Three exist because the (then) 0.6B failed on them in testing: a request that *writes*
 code is never sent to it however short it is (`scrivi una funzione python …`, 9
 words, produced broken docstring prose), nor is one that asks what a technical
 term *is* (it answered `MoE = "Model of Explanation"`), nor a short *factual*
@@ -688,7 +688,7 @@ llama.cpp reuses its cache and only the new message is prefilled. That cache
 hit is the real payoff of a small tool surface, more than the tokens
 themselves. `cheap/auto` routes through the orchestrator. `auto`, `router` and
 `orchestrator` are the magic ids that mean "route this" — `router` included, it
-does not pin the 0.6B; `reasoner` and `vision` are the direct ids, useful for
+does not pin the fast tier; `reasoner` and `vision` are the direct ids, useful for
 debugging only.
 
 ### Which id to choose in the model picker
@@ -711,8 +711,8 @@ is a *direct* llama-swap model that bypasses that decision.
 `auto`, `router` and `orchestrator` are the three ids the router itself treats as
 "decide for me"; `cheap/router` through LiteLLM arrived as the literal model id
 `router`, so the two meanings met in the same picker. Keeping the fast tier
-reachable as `fast` / `tiny` / `lfm3` (and the 0.6B as `router-0.6b`) while hiding
-`cheap/router` removes the ambiguity without losing either tier.
+reachable as `fast` / `tiny` / `lfm3` while hiding `cheap/router` removes the
+ambiguity without losing the tier.
 
 ### Why "search the web" used to hang (measured 26 Nov)
 
