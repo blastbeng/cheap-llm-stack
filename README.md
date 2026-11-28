@@ -798,14 +798,48 @@ Five faults stacked into one symptom — an answer that never arrives:
    instead of 3 × 220, 1 200 chars total, under the router's 1 500 cap): the first
    snippet for an Italian query is now real prose from the article.
 
-**A turn that already carries three tool results answers with them.**
-`ROUTER_TOOL_LOOP_MAX_RESULTS` (default **3**, `0` disables) strips `tools`,
-`tool_choice` and `parallel_tool_calls` from the request before it is forwarded,
-so the only thing the model can produce is the answer. Removing the tools is what
-terminates the loop — a bigger thinking budget buys another 30-60 s of planning
-(measured with the tools still in the body: budget 96 / 160 / 256 → 0/2 answers;
-without them: 2/2). The guard also forces the 256-token synthesis budget, even
-though `awaiting_tool_answer()` would normally infer it from the last message.
+**A turn that already carries ten tool results answers with them.**
+`ROUTER_TOOL_LOOP_MAX_RESULTS` (default **10**, `0` disables) now ends the loop
+*with the schemas still in the body*: `tool_choice` is downgraded to `auto` when
+the client forced `required`/`any`, and one extra user message — an answer-now
+note (`ROUTER_LOOP_GUARD_NOTE`, it names the result count) — is appended at the
+**end** of the conversation. The guard also forces the 256-token synthesis
+budget, even though `awaiting_tool_answer()` would normally infer it from the
+last message.
+
+Why not remove the tools, as this router did until 28 Nov. `llama.cpp` installs
+the model's tool-call parser only when `tools` is in the request, and with the
+parser gone the model's native Hermes markup
+(`<tool_call>web_search<arg_key>…`) leaves as ordinary `content`: Open WebUI
+renders it verbatim, executes nothing, and closes the run with
+`usage.incomplete` (chat `63fdf696`, 28 Nov). `tool_choice: "none"` is not the
+way around it — the server drops the schemas from the rendered prompt all the
+same (probe: prompt_n 132 → 4, markup leaked). Appending the note instead of
+rewriting the message list keeps the cached prefix byte-identical: measured on
+the board, the first guarded turn prefilled 661 tokens and the repeat of the
+same request **4**. The ceiling moved 3 → 10 because three results were often
+too few for the question that started the loop (the same chat kept searching);
+with ten, the model has the evidence and the ~1 060-token tool surface is not
+thrown away for nothing.
+
+**When a client strips the tools anyway, the leaked call is repaired.**
+`ROUTER_REPAIR_TEXT_CALLS` (default `1`) rewrites a text
+`<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` block
+into a real `tool_calls` entry, with a deterministic `call_<sha1>` id and JSON
+arguments (`<arg_value>10</arg_value>` is the number 10), leaving any prose
+around it as `content`. Only names the conversation already knows are accepted
+— the request's `tools`/`functions` or a call already present in the history —
+so a chat that never had tools cannot be given an invented one. Streaming
+needs a one-prefix hold: the markup arrives as ordinary content deltas, so the
+first characters of each message are held until `<tool_call>` is ruled in or
+out, then the calls are attached to the finish chunk with
+`finish_reason: "tool_calls"`; usage and `[DONE]` pass through untouched.
+Measured live on the board, 28 Nov: a 5-message tool history with no `tools`
+and an explicit "usa il tool web_search" produced a 104-chunk SSE stream with
+`content: ""` and one repaired `web_search` call, and the router logged
+`repaired a text tool call into tool_calls (web_search)`; the non-streaming
+request returned the same call as JSON. Plain prose and byte-faithful
+passthrough are covered by the local harness.
 
 Measured end to end through the real 7-tool surface (`e2e`: router → llama-swap →
 MoE, tools executed on `mcp-tools-lite`):
@@ -814,8 +848,13 @@ MoE, tools executed on `mcp-tools-lite`):
 | --- | --- | --- |
 | "chi è Gerry Scotti? cerca sul web" | 3 turns, 55 s each, empty answer | search 13.1 s → read article 41.6 s → **answer, 99.4 s total** |
 | same, second page tried first | `content: ""`, `incomplete` | 2 hops, answer |
-| "confronta le due Wikipedia, leggi entrambe" | loop until the budget dies | 3 results → `loop guard: 3 tool results already`, answer (234 s, 800-token answer) |
+| "confronta le due Wikipedia, leggi entrambe" | loop until the budget dies | 3 results → `loop guard: 3 tool results already`, answer (234 s, 800-token answer; measured with the old ceiling of 3) |
 | `scripts/toolcheck.py` 9-case battery | 9/9 | **9/9** (20-27 s per case, `synthweb` 83 s) |
+
+The guard was re-measured on the board with the schemas kept: a 10-result tool
+history answered in 40 s (`finish: stop`, **0 calls**, 661 prompt / 136 completion
+tokens) instead of looping, and the repeat of the same turn prefilled only 4
+tokens against the 143 s full re-prefill the strip-and-rewrite guard used to pay.
 
 **The iteration cap is deliberately left at -1 (unlimited)** in Open WebUI.
 Capping it at 8 does terminate the bad loop, but it also kills the long agentic

@@ -17,9 +17,15 @@ Environment=PYTHONUNBUFFERED=1
 # Advertised window. Must match the `reasoner` --ctx-size in config.yaml: this is
 # what /v1/models and /health report, and what agent clients budget against.
 Environment=ROUTER_CONTEXT_LENGTH=16384
-# Loop guard: after 3 tool results a turn answers with what it has (tools are
-# withdrawn from the request). 0 disables it.
-Environment=ROUTER_TOOL_LOOP_MAX_RESULTS=3
+# Loop guard: after 10 tool results a turn answers with what it has. The schemas
+# stay in the request — removing them (or tool_choice:"none", same thing) makes
+# llama.cpp stop parsing and the model's `<tool_call>` markup leak into `content`
+# as text, which is what killed the 08:09 automation run. 0 disables it.
+Environment=ROUTER_TOOL_LOOP_MAX_RESULTS=10
+# Turn a text `<tool_call>` block into a real `tool_calls` reply (streaming too).
+# Safety net for a client that strips `tools` on its synthesis turn, or a template
+# regression; 0 disables it.
+Environment=ROUTER_REPAIR_TEXT_CALLS=1
 # Quality tier escalation from `auto`: ON. A request that asks for reasoning and is
 # longer than ROUTER_DEEP_MIN_CHARS (600) chars or 40 words goes to Nemotron-3.5-Bolt
 # for its whole session, including the turns that carry tool results; everything else

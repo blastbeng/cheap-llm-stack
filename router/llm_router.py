@@ -157,11 +157,29 @@ TOOLS_MIN_TEMPERATURE = float(os.environ.get("ROUTER_TOOLS_MIN_TEMPERATURE", "0.
 # measured on Open WebUI chat 1f7d4872 (web_search -> web_url_read EN -> IT,
 # 55 s per turn) it never stopped because every result was page chrome, and the
 # fourth turn spent its whole 256-token thinking budget planning another fetch
-# and returned no content at all (empty answer, usage.incomplete). After this
-# many tool results the turn is a synthesis turn whether the model agrees or
-# not: `tools` is removed from the body, so the only way to answer is to answer.
-# 0 disables the guard.
-TOOL_LOOP_MAX_RESULTS = int(os.environ.get("ROUTER_TOOL_LOOP_MAX_RESULTS", "3"))
+# and returned no content at all (empty answer, usage.incomplete). So after this
+# many tool results the turn is a synthesis turn whether the model agrees or not.
+#
+# What the guard must NOT do is take the schemas away. Measured here on 28 Nov,
+# replayed history, same seed: llama.cpp installs the model's tool-call parser
+# only when `tools` is in the request, and `tool_choice: "none"` is not a way
+# around it — the server drops the schemas from the rendered prompt all the same
+# (prompt_n 132 -> 4). Either way the model's native
+# `<tool_call>/<arg_key>/<arg_value>` markup leaks into `content` as plain text,
+# Open WebUI renders it verbatim and the run ends with usage.incomplete — that is
+# exactly how the 08:09 automation died after three calls. Keeping the schemas
+# and appending one user message instead: 2/2 prose answers, 15 s, no call. It is
+# also cheaper, because the cached prefix survives and only the appended line is
+# prefilled, where dropping the tools re-prefilled all 3 011 tokens (143 s).
+#
+# 10 results leaves a real run (search -> read -> read -> ...) room before the
+# synthesis is forced; 0 disables the guard.
+TOOL_LOOP_MAX_RESULTS = int(os.environ.get("ROUTER_TOOL_LOOP_MAX_RESULTS", "10"))
+LOOP_GUARD_NOTE = os.environ.get(
+    "ROUTER_LOOP_GUARD_NOTE",
+    "[router] %d tool results are already in this turn and no further tool result "
+    "will be available. Do not call a tool: answer now with what you have, and say "
+    "explicitly what you could not verify.")
 # The quality tier (llama-swap model `bolt`, Nemotron-3.5-Bolt-E4B) is reached by
 # `auto` when a request is plainly a deep one: long *and* asking for reasoning, on
 # the first turn of a session, which is then pinned there (sticky-deep) so a
@@ -758,6 +776,142 @@ def cap_tool_results(messages: list[dict], limit: int = TOOL_RESULT_MAX_CHARS) -
     return cut
 
 
+# ------------------------------------------------------ text tool-call repair ---
+# A client can strip `tools` on its own synthesis turn, and a chat template can
+# regress; llama.cpp then passes the model's native
+# `<tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>` block
+# through as ordinary `content`. Measured on Open WebUI 28 Nov: it is shown as
+# text, nothing is executed, the run dies with usage.incomplete. The router knows
+# which tools the conversation is allowed to call, so it can turn that dead end
+# back into a real call — streaming included, where the markup arrives as ordinary
+# content deltas and the first chars have to be held back until it is decided.
+REPAIR_TEXT_CALLS = os.environ.get("ROUTER_REPAIR_TEXT_CALLS", "1") == "1"
+TEXT_CALL_RE = re.compile(r"<tool_call>\s*([^\s<]+)\s*(.*?)</tool_call>", re.S)
+TEXT_ARG_RE = re.compile(
+    r"<arg_key>\s*(.*?)\s*</arg_key>\s*<arg_value>\s*(.*?)\s*</arg_value>", re.S)
+
+
+def known_tools(body: dict) -> set:
+    """Tool names this conversation may call: the schema, plus what it already did."""
+    names = set()
+    for entry in body.get("tools") or []:
+        fn = (entry or {}).get("function") or {}
+        if isinstance(fn.get("name"), str):
+            names.add(fn["name"])
+    for entry in body.get("functions") or []:
+        if isinstance(entry, dict) and isinstance(entry.get("name"), str):
+            names.add(entry["name"])
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        for call in m.get("tool_calls") or []:
+            fn = (call or {}).get("function") or {}
+            if isinstance(fn.get("name"), str):
+                names.add(fn["name"])
+    return names
+
+
+def _arg_value(raw: str):
+    """`<arg_value>10</arg_value>` is the number 10; anything else stays a string."""
+    try:
+        return json.loads(raw)
+    except Exception:
+        return raw
+
+
+def parse_text_calls(text: str, allowed: set):
+    """(calls, leftover) out of the model markup; calls is None when there is none.
+
+    Only names the conversation already knows are accepted: the point is to
+    rescue a call the server failed to parse, not to invent one for a chat that
+    never had tools.
+    """
+    if not isinstance(text, str) or "<tool_call>" not in text:
+        return None, text
+    calls = []
+    for match in TEXT_CALL_RE.finditer(text):
+        name = match.group(1).strip()
+        if not name or name not in allowed:
+            continue
+        args = {}
+        for key, value in TEXT_ARG_RE.findall(match.group(2) or ""):
+            args[key.strip()] = _arg_value(value.strip())
+        digest = hashlib.sha1(("%s:%s" % (name, json.dumps(args, sort_keys=True)))
+                              .encode()).hexdigest()[:24]
+        calls.append({"id": "call_" + digest, "type": "function",
+                      "function": {"name": name,
+                                   "arguments": json.dumps(args, ensure_ascii=False)}})
+    if not calls:
+        return None, text
+    return calls, TEXT_CALL_RE.sub("", text).strip()
+
+
+def repair_message(message: dict, allowed: set) -> bool:
+    """Rewrite `content` markup into `tool_calls` in place. True if it fired."""
+    if not isinstance(message, dict) or message.get("tool_calls"):
+        return False
+    calls, leftover = parse_text_calls(message.get("content"), allowed)
+    if not calls:
+        return False
+    message["tool_calls"] = calls
+    message["content"] = leftover
+    return True
+
+
+class TextCallSniffer:
+    """Holds the first content chars of an SSE message until it knows what they are.
+
+    A leaked call starts at the very beginning of `content` and arrives as many
+    ordinary deltas, so those deltas cannot be forwarded while they may still
+    turn out to be a call. The hold is one short prefix, once per message.
+    """
+
+    MARK = "<tool_call>"
+
+    def __init__(self, allowed: set):
+        self.allowed = allowed
+        self.state = "sniff"       # sniff -> pass, or sniff -> collect -> pass
+        self.held = ""
+        self.calls = None
+
+    def feed(self, text: str) -> str:
+        """The part of `text` that may go out now."""
+        if self.state == "pass":
+            return text
+        self.held += text
+        while True:
+            if self.state == "sniff":
+                probe = self.held.lstrip()
+                if not probe:
+                    return ""
+                if probe.startswith(self.MARK):
+                    self.state = "collect"
+                    continue
+                if len(probe) <= len(self.MARK) and self.MARK.startswith(probe):
+                    return ""
+                out, self.held, self.state = self.held, "", "pass"
+                return out
+            if self.state == "collect":
+                if "</tool_call>" not in self.held:
+                    return ""
+                calls, leftover = parse_text_calls(self.held, self.allowed)
+                if not calls:
+                    out, self.held, self.state = self.held, "", "pass"
+                    return out
+                self.calls, self.held, self.state = calls, "", "pass"
+                return leftover
+            return text
+
+    def pending(self) -> str:
+        """Whatever is still held (a truncated markup) — flush at end of message."""
+        out, self.held = self.held, ""
+        return out
+
+    def take(self):
+        calls, self.calls = self.calls, None
+        return calls
+
+
 def apply_route_knobs(body: dict, route: str) -> dict:
     """Per-route sampling knobs: thinking budget, a token floor, a temperature floor."""
     msgs = body.get("messages") or []
@@ -765,15 +919,18 @@ def apply_route_knobs(body: dict, route: str) -> dict:
     if route in ("tools", "deep") and body.get("tools") and TOOL_LOOP_MAX_RESULTS > 0:
         used = tool_result_count(msgs)
         if used >= TOOL_LOOP_MAX_RESULTS:
-            # Enough evidence: answer with it. Removing the tools is what makes
-            # the turn terminate — a bigger thinking budget only buys another
-            # 30-60 s of planning another fetch (measured: budget 96/160/256 with
-            # the tools still there, 0/2 answers; without them, 2/2).
-            body.pop("tools", None)
-            for key in ("tool_choice", "parallel_tool_calls", "functions", "function_call"):
-                body.pop(key, None)
+            # Enough evidence: answer with it — but keep the schemas. Dropping
+            # them (or tool_choice:"none", which the server turns into the same
+            # thing) is what leaks the native `<tool_call>` markup into `content`
+            # and kills the client's run; see TOOL_LOOP_MAX_RESULTS. The ask goes
+            # in a message at the END of the conversation, so the cached prefix
+            # stays byte-identical and only the new line is prefilled.
+            note = LOOP_GUARD_NOTE % used if "%d" in LOOP_GUARD_NOTE else LOOP_GUARD_NOTE
+            body["messages"] = list(msgs) + [{"role": "user", "content": note}]
+            if body.get("tool_choice") in ("required", "any"):
+                body["tool_choice"] = "auto"
             guarded = True
-            log("loop guard: %d tool results already, tools withdrawn for this turn" % used)
+            log("loop guard: %d tool results already, answering with the schemas kept" % used)
     if route == "tools" and (guarded or awaiting_tool_answer(msgs)):
         # Budget is only injected when the client has not chosen one, same rule as
         # every other route.
@@ -1006,6 +1163,7 @@ class Handler(BaseHTTPRequestHandler):
                     "tools_synth_budget": TOOLS_SYNTH_BUDGET,
                     "tool_result_max_chars": TOOL_RESULT_MAX_CHARS,
                     "tool_loop_max_results": TOOL_LOOP_MAX_RESULTS,
+                    "repair_text_calls": REPAIR_TEXT_CALLS,
                     "deep_tier": DEEP_ENABLED,
                     "context_length": CONTEXT_LENGTH,
                     "prototypes_ready": PROTO.ready.is_set()}
@@ -1039,6 +1197,9 @@ class Handler(BaseHTTPRequestHandler):
             cut = cap_tool_results(body.get("messages") or [])
             if cut:
                 log("capped %d tool result(s) at %d chars" % (cut, TOOL_RESULT_MAX_CHARS))
+            # Names the answer may legitimately turn back into a call (see
+            # parse_text_calls); empty means no repair for this request.
+            allowed = known_tools(body) if REPAIR_TEXT_CALLS else set()
             requested = str(body.get("model") or "auto")
             if requested and requested.lower() not in ("auto", "router", "orchestrator"):
                 # A concrete id is forwarded verbatim (that is how a client debugs one
@@ -1058,8 +1219,9 @@ class Handler(BaseHTTPRequestHandler):
                         % (model, requested))
                     return self._forward(json.dumps(body).encode(), path, model, "tools",
                                          "tools-on-tiny", 0.0,
-                                         body.get("reasoning_budget_tokens"))
-                return self._forward(raw, path, requested, requested, "client", 0.0)
+                                         body.get("reasoning_budget_tokens"), allowed)
+                return self._forward(raw, path, requested, requested, "client", 0.0, None,
+                                     allowed)
 
             t0 = time.time()
             route, why = decide(body, self.headers, self.address_string())
@@ -1078,14 +1240,14 @@ class Handler(BaseHTTPRequestHandler):
             if DEBUG_BODY:
                 log("forwarded: %s" % json.dumps(body, ensure_ascii=False)[:2000])
             return self._forward(json.dumps(body).encode(), path, model, route, why, elapsed,
-                                 body.get("reasoning_budget_tokens"))
+                                 body.get("reasoning_budget_tokens"), allowed)
 
         # everything else: transparent
         return self._forward(raw, path, "passthrough", "passthrough", "passthrough", 0.0)
 
     # -- proxying --------------------------------------------------------------
     def _forward(self, raw: bytes, path: str, model: str, route: str, why: str, ms: float,
-                 budget=None):
+                 budget=None, allowed: set | None = None):
         conn, headers = self._upstream("POST", path)
         try:
             conn.request("POST", path, body=raw, headers=headers)
@@ -1113,12 +1275,15 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             self.end_headers()
             try:
-                while True:
-                    chunk = resp.read(2048)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if allowed:
+                    self._relay_repair(resp, allowed)
+                else:
+                    while True:
+                        chunk = resp.read(2048)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
             finally:
@@ -1127,9 +1292,107 @@ class Handler(BaseHTTPRequestHandler):
 
         data = resp.read()
         conn.close()
+        if allowed:
+            data = self._repair_json(data, allowed)
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _repair_json(self, data: bytes, allowed: set) -> bytes:
+        """Non-streaming: `content` holding a text tool call becomes `tool_calls`."""
+        try:
+            payload = json.loads(data or b"{}")
+        except Exception:
+            return data
+        fired = 0
+        for choice in payload.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            if repair_message(choice.get("message") or {}, allowed):
+                choice["finish_reason"] = "tool_calls"
+                fired += 1
+        if not fired:
+            return data
+        log("repaired %d text tool call(s) into tool_calls" % fired)
+        return json.dumps(payload, ensure_ascii=False).encode()
+
+    def _relay_repair(self, resp, allowed: set) -> None:
+        """SSE relay that rewrites a leaked `<tool_call>` block into a real call.
+
+        Everything else is byte-identical to the old pass-through relay: the only
+        thing this touches is `choices[].delta.content`, and only while the first
+        chars are still undecided (see TextCallSniffer).
+        """
+        sniffer = TextCallSniffer(allowed)
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            stripped = line.strip()
+            if not stripped.startswith(b"data:"):
+                self.wfile.write(line)
+                self.wfile.flush()
+                continue
+            payload = stripped[5:].strip()
+            if payload == b"[DONE]":
+                calls, tail = sniffer.take(), sniffer.pending()
+                if calls or tail:
+                    self.wfile.write(self._sse_chunk({"content": tail} if tail else {}, calls))
+                self.wfile.write(line)
+                self.wfile.flush()
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                self.wfile.write(line)
+                self.wfile.flush()
+                continue
+            if self._rewrite_event(event, sniffer):
+                line = b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n"
+            self.wfile.write(line)
+            self.wfile.flush()
+
+    @staticmethod
+    def _sse_chunk(delta: dict, calls=None) -> bytes:
+        body = dict(delta)
+        if calls:
+            body["tool_calls"] = calls
+        event = {"choices": [{"index": 0, "delta": body,
+                              "finish_reason": "tool_calls" if calls else None}]}
+        return b"data: " + json.dumps(event, ensure_ascii=False).encode() + b"\n"
+
+    def _rewrite_event(self, event: dict, sniffer: TextCallSniffer) -> bool:
+        """Patch one SSE event in place; True when it must be re-serialised."""
+        touched = False
+        for choice in event.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("content"), str):
+                keep = sniffer.feed(delta["content"])
+                if keep != delta["content"]:
+                    touched = True
+                    if keep:
+                        delta["content"] = keep
+                    else:
+                        delta.pop("content", None)
+            finishing = bool(choice.get("finish_reason"))
+            calls = sniffer.take() if finishing else None
+            tail = sniffer.pending() if finishing else ""
+            if calls or tail:
+                body = dict(choice.get("delta") or {})
+                if tail:
+                    body["content"] = (body.get("content") or "") + tail
+                if calls:
+                    body["tool_calls"] = calls
+                    choice["finish_reason"] = "tool_calls"
+                    log("repaired a text tool call into tool_calls (%s)"
+                        % (calls[0]["function"]["name"]))
+                else:
+                    body["content"] = tail
+                choice["delta"] = body
+                touched = True
+        return touched
 
     def _models(self):
         """Advertise llama-swap's models plus the orchestrator itself.
