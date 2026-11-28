@@ -327,7 +327,7 @@ The knobs, measured on Moon-Beam at d2048 unless said otherwise:
 | `-ub 1024` | pp 17.43, tg 6.13 (+0.4 % / +0.8 %) | reject: noise, keep the default 512 |
 | `--spec-type ngram-simple` (n-gram drafting, 220-token answer, `-r` 218-iteration repeats) | a repetitive JSON prompt 5.66 → 6.11 tok/s (+8 %, 102/194 drafts accepted); an ordinary Italian prose prompt **7.32 → 6.48 (−11 %, 1/48 accepted)**; `ngram-mod` is worse than baseline on the JSON prompt too (5.01, 6/192) | reject: it pays only on boilerplate, and the flag is per *server*, so the same `reasoner` that drafts tool JSON also writes the answer. The 53 % acceptance on JSON is exactly the shape the grammar already produces for free |
 | **OpenBLAS** (`-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS`, otherwise the same flags, isolated build) | 2B: pp 24.39/37.97, tg 6.87/6.80 (was 24.20/38.47, 6.81/6.71); Moon-Beam: pp 10.82/16.66, tg 6.06/6.15 (was 10.96/17.36, 5.98/6.08) | **reject**: a wash, and it would put a library dependency into the weekly rebuild. `ggml-blas` only calls `cblas_sgemm` for matmuls with batch ≥ 32 and dequantizes the weights to f32 first — on a bandwidth-bound board that is the one thing it cannot afford |
-| **`vm.swappiness` 100 → 10** (`scripts/tune.sh --apply`, which had never been run on this board) | 2B tg 6.20 → 6.71-6.81 at d2048; `vmstat` si/so 715/492 → 0, `Swap` 4 GB → 0 | **shipped** — the only real win of the whole pass, and it was the OS, not a model: at 100 the kernel evicts the mmap'd weights to zram mid-run |
+| **`vm.swappiness` 100 → 10** (`scripts/tune.sh --apply`, which had never been run on this board) | 2B tg 6.20 → 6.71-6.81 at d2048; `vmstat` si/so 715/492 → 0, `Swap` 4 GB → 0 | **shipped** — the only real win of the whole pass, and it was the OS, not a model: at 100 the kernel evicts the mmap'd weights to zram mid-run. Shipping it took a second fix: `armbian-config`'s `99-zz-armbian-tuning-profile.conf` sorts after a `90-*` drop-in and puts the value back to 100, so `tune.sh` now writes **`99-zzz-cheap-llm-stack.conf`** |
 
 That last line is now a permanent guard: `healthcheck.sh` warns when
 `/proc/sys/vm/swappiness` disagrees with what `tune.sh` writes, and when more than
@@ -1063,7 +1063,12 @@ board served for weeks with `vm.swappiness=100` because of it. At 100 the kernel
 evicts the mmap'd weights to zram mid-conversation (measured on 28 Nov: −9 % decode
 and 715/492 pages/s of swap I/O), which looks exactly like "the model got slower".
 `healthcheck.sh` now warns when the sysctl disagrees with `tune.sh` or when more
-than 20 % of swap is in use.
+than 20 % of swap is in use — and it is worth reading: it caught this board back at
+100 within minutes of the drop-in being written, because `armbian-config`'s
+`99-zz-armbian-tuning-profile.conf` (swappiness 100, dirty ratios 20/1, written for
+flash endurance) sorts *after* `90-*` and any `sysctl --system` re-applies it. Ours
+therefore lives in `99-zzz-cheap-llm-stack.conf`, after theirs; a 90-* file is
+visibly written and visibly ignored.
 
 Model downloads are resumable (`curl -C -`); re-running `install.sh` only fetches
 what is missing. llama.cpp is rebuilt every Sunday at 03:00 by

@@ -117,6 +117,7 @@ awk '{printf "  temp: %.0f C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp
 # at the rates the README quotes.
 echo "os tuning"
 want=$(sed -n 's/^vm\.swappiness[[:space:]]*=[[:space:]]*//p' \
+       /etc/sysctl.d/99-zzz-cheap-llm-stack.conf \
        /etc/sysctl.d/90-cheap-llm-stack.conf 2>/dev/null | head -1)
 have=$(cat /proc/sys/vm/swappiness 2>/dev/null)
 if [ -n "${want}" ] && [ "${want}" != "${have}" ]; then

@@ -24,7 +24,13 @@
 #
 set -euo pipefail
 
-SYSCTL_FILE="/etc/sysctl.d/90-cheap-llm-stack.conf"
+# Name matters: armbian-config writes /etc/sysctl.d/99-zz-armbian-tuning-profile.conf
+# (swappiness 100, dirty_ratio 20, dirty_background_ratio 1) and sorts *after* a
+# 90-* file, so a 90-* drop-in is silently overridden by the `sysctl --system` at
+# the end of apply_sysctl(). Anything older than 99-zz leaves the board at
+# swappiness 100 even though --check reads 10 back from this file.
+SYSCTL_FILE="/etc/sysctl.d/99-zzz-cheap-llm-stack.conf"
+SYSCTL_FILE_LEGACY="/etc/sysctl.d/90-cheap-llm-stack.conf"
 GOV_SERVICE="/etc/systemd/system/cheap-llm-stack-governor.service"
 STACK_DIR="${STACK_DIR:-/opt/cheap-llm-stack}"
 GOVERNOR="${GOVERNOR:-performance}"   # performance | schedutil | powersave
@@ -75,6 +81,7 @@ check_sysctl() {
 }
 
 apply_sysctl() {
+    rm -f "${SYSCTL_FILE_LEGACY}"
     { echo "# managed by cheap-llm-stack scripts/tune.sh"; echo "# generated $(date -Is)"
       while IFS='=' read -r k v; do [ -n "${k}" ] && echo "${k} = ${v}"; done <<< "${SYSCTL_WANT}"
     } > "${SYSCTL_FILE}"
@@ -200,7 +207,7 @@ case "${MODE}" in
         ;;
     revert)
         say "reverting OS-level tuning"
-        rm -f "${SYSCTL_FILE}"
+        rm -f "${SYSCTL_FILE}" "${SYSCTL_FILE_LEGACY}"
         systemctl disable --now cheap-llm-stack-governor.service 2>/dev/null || true
         rm -f "${GOV_SERVICE}"
         systemctl daemon-reload
