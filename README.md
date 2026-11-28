@@ -976,19 +976,25 @@ MoE, tools executed on `mcp-tools-lite`):
 | `scripts/toolcheck.py` 9-case battery | 9/9 | **9/9** (20-27 s per case, `synthweb` 83 s) |
 
 The same turn was then replayed through **Open WebUI's own chat-completions
-pipeline** (28 Nov, `POST /api/chat/completions` with `tool_ids:
+pipeline** (28 Nov, `POST /api/chat/completions` with an API key — `ENABLE_API_KEYS`
+is now on in the Open WebUI compose for exactly this test — and `tool_ids:
 ["server:mcp:mcp-tools-lite"]`, the MCP server resolved from
 `tool_server.connections`, so the tool surface is the production one and the model
-sees the real `mcp-tools-lite_*` names): **13.8 s, 69 completion tokens, one native
-`tool_calls` entry** — `mcp-tools-lite_web_search` with
-`{"query": "Gerry Scotti chi è e programma che conduce adesso", "count": 5}`, no
-markup in `content` — with the router logging `route=tools model=reasoner
-budget=96` and the 0.2 → 0.6 temperature raise. `usage.prompt_tokens` 2214 of which
-**2179 cached**: the KV prefix survives LiteLLM → router → llama-swap, which is why
-the tool surface costs nothing after the first turn. The continuation (execute the
-call, feed the result back) is Open WebUI's job and only runs on a saved chat with
-its websocket events, so confirming *that* half needs one click in the UI; the
-model half is measured.
+sees the real `mcp-tools-lite_*` names). The whole loop, end to end, executed by
+hand because Open WebUI stops at the call on a non-saved chat (no `chat_id`, so no
+websocket events, no `pause_for_tool_approval` — the call is simply returned to the
+caller):
+
+| round | router | wall | what came back |
+| --- | --- | --- | --- |
+| user asks "cerca sul web chi è Gerry Scotti…" | `route=tools budget=96` | 15.3 s | one native `tool_calls`: `mcp-tools-lite_web_search{"query": "Gerry Scotti chi è programma adesso", "count": 3}`, no markup in `content`, 69 tokens, prompt 2214 of which **2179 cached** |
+| result fed back | `route=tools by=sticky-loop budget=256` | 36.6 s | **another `web_search`** with a re-worded query — the `synthweb` failure, live |
+| second result fed back | `route=tools by=sticky-loop budget=256` | 61.1 s | `finish_reason: stop`, no call, and the answer is right: quiz/varietà host, *Caduta libera*, with the Max Giusti handover noted |
+
+113 s for a two-hop search that a human would call one question. The temperature
+raise (0.2 → 0.6 on the tool turn) fired on every round, and the KV prefix survived
+LiteLLM → router → llama-swap on all three (2217 tokens cached on rounds two and
+three), which is the whole point of keeping the tool surface byte-identical.
 
 The guard was re-measured on the board with the schemas kept: a 10-result tool
 history answered in 40 s (`finish: stop`, **0 calls**, 661 prompt / 136 completion
