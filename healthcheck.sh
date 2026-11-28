@@ -111,4 +111,25 @@ echo "system"
 free -h | sed 's/^/  /'
 awk '{printf "  temp: %.0f C\n", $1/1000}' /sys/class/thermal/thermal_zone0/temp 2>/dev/null
 
+# Both of these are silent performance bugs, not breakage: at swappiness 100 the
+# kernel evicts the mmap'd weights to zram mid-run (measured: -9 % decode plus
+# 715/492 pages/s of swap I/O), and a stack that swaps cannot be trusted to serve
+# at the rates the README quotes.
+echo "os tuning"
+want=$(sed -n 's/^vm\.swappiness[[:space:]]*=[[:space:]]*//p' \
+       /etc/sysctl.d/90-cheap-llm-stack.conf 2>/dev/null | head -1)
+have=$(cat /proc/sys/vm/swappiness 2>/dev/null)
+if [ -n "${want}" ] && [ "${want}" != "${have}" ]; then
+    echo "  [warn] vm.swappiness is ${have:-?}, tune.sh wants ${want} - sudo scripts/tune.sh --apply"
+else
+    echo "  [ok]   vm.swappiness ${have:-?}"
+fi
+swap_pct=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} \
+                END{if (t>0) printf "%d", (t-f)*100/t; else printf "0"}' /proc/meminfo)
+if [ "${swap_pct:-0}" -gt 20 ]; then
+    echo "  [warn] swap ${swap_pct}% used - model pages are being evicted"
+else
+    echo "  [ok]   swap ${swap_pct}% used"
+fi
+
 exit "${fail}"

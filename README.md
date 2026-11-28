@@ -256,6 +256,83 @@ grammar for the tool call itself, so a second one is rejected outright. That is 
 why every battery failure is a *wrong choice* and never malformed JSON — the call
 channel is already constrained, so B was dropped rather than worked around.
 
+### Re-evaluation, 28 Nov 2026: Qwen3.5, threads, OpenBLAS, depth
+
+The question was whether a model released after the ones shipped (the Qwen3.5
+family: hybrid Gated DeltaNet + sparse MoE, 262k native context) changes any seat,
+and whether the serving knobs left any speed on the table. Same harness as above
+(`llama-bench -fa on -ctk q8_0 -ctv q8_0 -d 2048 -p 512 -n 128 -r 2 -t 2,8`), but
+**at depth 2048** — a real turn is never a 512-token prompt, and depth is exactly
+where the architectures separate: a model with attention in every layer pays for
+every token in the KV, a hybrid one does not.
+
+| model | file | pp512 @ d2048 t2 / t8 | tg128 @ d2048 t2 / t8 | note |
+| --- | --- | --- | --- | --- |
+| Qwen3.5-2B Q4_0 | 1.12 GiB | **24.2 / 38.5** | 6.81 / 6.71 | hybrid; 8/9 battery; the best long-context engine measured here |
+| Qwen3.5-4B Q4_0 | 2.40 GiB | 7.2 / 12.9 | 2.88 / 3.01 | reject: 1k-token prefill = 78 s |
+| Qwen3.5-9B Q4_0 | 5.00 GiB | 5.0 / 8.7 | 1.73 / 1.78 | reject: 1.7 tok/s |
+| **Moon-Beam-8B-A1B IQ4_XS** (shipped) | 4.49 GiB | 11.0 / 17.4 | 5.98 / 6.08 | **9/9** again today — still no rival at 9/9 |
+| LFM2.5-8B-A1B Q4_0 | 4.50 GiB | 14.4 / 22.9 | 8.24 / 7.89 | 6/9 at temperature 0.2 (8/9 at 0.6, the Nov-27 run) |
+| **LFM3-1.7B QAD-Q4_0** (shipped) | 0.99 GiB | 24.5 / 38.3 | **8.53 / 8.26** | 8/9, 12-22 s per call |
+| Nemotron-3.5-Bolt E4B Q4_K_M (shipped deep) | 5.74 GiB | 6.8 / 11.3 | 2.53 / 2.47 | 9/9 at 3x the wall clock |
+
+Two things came out of this. First, **the MoE is still the right shape**: the 1.7B
+dense decodes faster than the 8B MoE (8.5 vs 6.0) and every dense model above 2B
+collapses — 3.0 tok/s at 4B, 1.8 at 9B — so "bigger but dense" is a downgrade on
+this board, exactly as the Nov-27 pass said. Second, **depth hurts the incumbents
+far more than the new hybrid**: at 8k depth LFM3 falls to 5.95 tok/s and Moon-Beam
+to 3.51, while Qwen3.5-2B still does 5.37 and prefills 12.6 tok/s against
+Moon-Beam's 4.64. The hybrid keeps KV in only a few layers (gated shortconv
+elsewhere) — the trick that made 16k affordable on the MoE, taken further.
+
+Depth ladder (r=1, `-d 0,2048,8192`), t2 pp / tg. This is the answer to "how much
+context can we afford", because allocating context is free and *filling* it is not:
+
+| model | d0 | d2048 | d8192 |
+| --- | --- | --- | --- |
+| Moon-Beam | 18.1 / 7.12 | 11.0 / 6.19 | 4.64 / 3.51 |
+| LFM3-1.7B | 41.0 / 10.11 | 24.3 / 8.56 | 10.8 / 5.95 |
+| Qwen3.5-2B | 33.8 / 7.41 | 24.0 / 6.81 | **12.6 / 5.37** |
+
+Nothing here argues for moving the windows: **16384 for the workhorse and 8192 for
+the fast tier stay**, because the wall clock of a full window is set by prefill and
+the incumbent's prefill at depth is what it always was. What the ladder does say is
+that a 16k turn on Moon-Beam is a ~10-minute prefill — which is why tool results are
+capped at 6000 chars upstream, and why Qwen3.5-2B is the model to reach for if a
+client ever genuinely needs 32k.
+
+The battery (9 cases, seed 1234, production flags, 16k ctx) decided the seats. Two
+budgets, because the router sends 96 for a call turn and 256 for the answer:
+
+| model | budget 32 | budget 96 | the failing case |
+| --- | --- | --- | --- |
+| **Moon-Beam** | **9/9** | — | — |
+| Qwen3.5-2B | 8/9 | 8/9 | `none`: answers "ciao, come stai?" with a `telegram_send_message` call |
+| LFM3-1.7B | 8/9 | 8/9 | `synth` at 32, `synthweb` at 96 — re-calls a tool instead of answering |
+| LFM2.5-8B-A1B | 6/9 | — | `tg` produced no call at all, plus `none` and `synthweb` |
+
+So **no seat moved.** A model that calls Telegram on "ciao" cannot hold the
+`assistant` route, and the fast tier is already faster per call with the same
+score. Qwen3.5-2B/Q4_0 stays on the board as the documented long-context
+alternative (`models/Qwen3.5-2B-Q4_0.gguf`, deliberately not wired into
+`config.yaml`); the 4B and 9B are kept only as re-bench material — a plain quant,
+not the `UD-*` dynamic ones, because the upcast layers cost CPU speed.
+
+The knobs, measured on Moon-Beam at d2048 unless said otherwise:
+
+| lever | measured | verdict |
+| --- | --- | --- |
+| `-t 2,4` instead of `-t 2,8` | pp 10.96 → 13.09 (+19 %), tg 6.06 → 5.16 (−15 %) | reject: a turn is decode-dominated |
+| `-C 0xC0 --cpu-strict 1` (A76 only) | t2 identical (10.94 / 5.98), t8 collapses to 0.49 tok/s | reject: production `-t 2` already lands on the A76s |
+| `-ub 1024` | pp 17.43, tg 6.13 (+0.4 % / +0.8 %) | reject: noise, keep the default 512 |
+| `--spec-type ngram-simple` (n-gram drafting, 220-token answer, `-r` 218-iteration repeats) | a repetitive JSON prompt 5.66 → 6.11 tok/s (+8 %, 102/194 drafts accepted); an ordinary Italian prose prompt **7.32 → 6.48 (−11 %, 1/48 accepted)**; `ngram-mod` is worse than baseline on the JSON prompt too (5.01, 6/192) | reject: it pays only on boilerplate, and the flag is per *server*, so the same `reasoner` that drafts tool JSON also writes the answer. The 53 % acceptance on JSON is exactly the shape the grammar already produces for free |
+| **OpenBLAS** (`-DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS`, otherwise the same flags, isolated build) | 2B: pp 24.39/37.97, tg 6.87/6.80 (was 24.20/38.47, 6.81/6.71); Moon-Beam: pp 10.82/16.66, tg 6.06/6.15 (was 10.96/17.36, 5.98/6.08) | **reject**: a wash, and it would put a library dependency into the weekly rebuild. `ggml-blas` only calls `cblas_sgemm` for matmuls with batch ≥ 32 and dequantizes the weights to f32 first — on a bandwidth-bound board that is the one thing it cannot afford |
+| **`vm.swappiness` 100 → 10** (`scripts/tune.sh --apply`, which had never been run on this board) | 2B tg 6.20 → 6.71-6.81 at d2048; `vmstat` si/so 715/492 → 0, `Swap` 4 GB → 0 | **shipped** — the only real win of the whole pass, and it was the OS, not a model: at 100 the kernel evicts the mmap'd weights to zram mid-run |
+
+That last line is now a permanent guard: `healthcheck.sh` warns when
+`/proc/sys/vm/swappiness` disagrees with what `tune.sh` writes, and when more than
+20 % of swap is in use, because both mean model pages are being evicted.
+
 ### Context: 16k is the ceiling, and time is what sets it
 
 Doubling the window costs **+57 MB** on this model (3.20 GB at 16k → 3.26 GB at 32k,
@@ -898,6 +975,21 @@ MoE, tools executed on `mcp-tools-lite`):
 | "confronta le due Wikipedia, leggi entrambe" | loop until the budget dies | 3 results → `loop guard: 3 tool results already`, answer (234 s, 800-token answer; measured with the old ceiling of 3) |
 | `scripts/toolcheck.py` 9-case battery | 9/9 | **9/9** (20-27 s per case, `synthweb` 83 s) |
 
+The same turn was then replayed through **Open WebUI's own chat-completions
+pipeline** (28 Nov, `POST /api/chat/completions` with `tool_ids:
+["server:mcp:mcp-tools-lite"]`, the MCP server resolved from
+`tool_server.connections`, so the tool surface is the production one and the model
+sees the real `mcp-tools-lite_*` names): **13.8 s, 69 completion tokens, one native
+`tool_calls` entry** — `mcp-tools-lite_web_search` with
+`{"query": "Gerry Scotti chi è e programma che conduce adesso", "count": 5}`, no
+markup in `content` — with the router logging `route=tools model=reasoner
+budget=96` and the 0.2 → 0.6 temperature raise. `usage.prompt_tokens` 2214 of which
+**2179 cached**: the KV prefix survives LiteLLM → router → llama-swap, which is why
+the tool surface costs nothing after the first turn. The continuation (execute the
+call, feed the result back) is Open WebUI's job and only runs on a saved chat with
+its websocket events, so confirming *that* half needs one click in the UI; the
+model half is measured.
+
 The guard was re-measured on the board with the schemas kept: a 10-result tool
 history answered in 40 s (`finish: stop`, **0 calls**, 661 prompt / 136 completion
 tokens) instead of looping, and the repeat of the same turn prefilled only 4
@@ -965,6 +1057,13 @@ sudo ./update-llama.cpp.sh        # rebuild llama.cpp at the tip of master (the 
 sudo LLAMA_CPP_SOURCE=release ./update-llama.cpp.sh   # newest release tag instead
 sudo LLAMA_CPP_TAG=v1.0.0 ./update-llama.cpp.sh       # one exact ref, bypasses the comparison
 ```
+
+`--check` is not cosmetic: a plain `install.sh` does not imply `--tune`, and this
+board served for weeks with `vm.swappiness=100` because of it. At 100 the kernel
+evicts the mmap'd weights to zram mid-conversation (measured on 28 Nov: −9 % decode
+and 715/492 pages/s of swap I/O), which looks exactly like "the model got slower".
+`healthcheck.sh` now warns when the sysctl disagrees with `tune.sh` or when more
+than 20 % of swap is in use.
 
 Model downloads are resumable (`curl -C -`); re-running `install.sh` only fetches
 what is missing. llama.cpp is rebuilt every Sunday at 03:00 by
